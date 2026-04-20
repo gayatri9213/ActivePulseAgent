@@ -1,0 +1,30 @@
+target/
+dist/
+input/
+installers/
+release/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config (never commit secrets)
+agent.env
+src/main/resources/agent.env
+
+# Local test artifacts
+*.log
+*.log.gz
+activepulse.db
+activepulse.db-*
+device-id
+activepulse.lock
+screenshots/

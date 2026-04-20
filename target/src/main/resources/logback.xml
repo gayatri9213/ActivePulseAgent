@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!--
+        Log directory resolved via 'activepulse.logs.dir' system property,
+        set by Main.java on JVM startup. Fallback: user.home/.activepulse/logs
+    -->
+    <property name="LOG_DIR" value="${activepulse.logs.dir:-${user.home}/.activepulse/logs}"/>
+    <property name="LOG_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
+
+    <!--
+        Daily file appender — no fixed <file> tag, filename IS the dated pattern.
+        Today's logs go into agent.2026-04-20.log; at midnight the next write
+        creates agent.2026-04-21.log automatically.
+    -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/agent.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>14</maxHistory>
+            <totalSizeCap>200MB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Library loggers — quiet by default -->
+    <logger name="org.quartz"                     level="WARN"/>
+    <logger name="com.zaxxer.hikari"              level="WARN"/>
+    <logger name="org.xerial.sqlite"              level="WARN"/>
+    <logger name="com.github.kwhat.jnativehook"   level="WARN"/>
+    <logger name="org.apache.http"                level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="FILE"/>
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>
