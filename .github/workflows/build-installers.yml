@@ -1,9 +1,8 @@
-
 name: Build Installers
 
 on:
   push:
-    branches: [ main ]   # triggers on both branches
+    branches: [ master ]   # triggers on master branch
   workflow_dispatch:            # also trigger manually from GitHub UI
 
 jobs:
@@ -36,6 +35,14 @@ jobs:
       - name: Build JAR
         run: mvn clean package -q
 
+      - name: Add jpackage to PATH
+        run: |
+          $javaHome = (Get-Command java).Source | Split-Path -Parent | Split-Path -Parent
+          $jpackagePath = Join-Path $javaHome "bin"
+          echo $jpackagePath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "jpackage path: $jpackagePath"
+          Get-Command jpackage -ErrorAction SilentlyContinue
+
       - name: Build Windows .exe installer
         run: |
           $env:TEMP = "C:\ap-tmp"
@@ -49,7 +56,11 @@ jobs:
             Copy-Item "src\main\resources\tray-icon.ico" "C:\ap-build\"
             $iconArg = @("--icon", "C:\ap-build\tray-icon.ico")
           }
-          & jpackage `
+          # Use full path to jpackage
+          $javaHome = (Get-Command java).Source | Split-Path -Parent | Split-Path -Parent
+          $jpackageExe = Join-Path $javaHome "bin\jpackage.exe"
+          Write-Host "Using jpackage: $jpackageExe"
+          & $jpackageExe `
             --type exe `
             --name "ActivePulse" `
             --app-version "1.0.0" `
@@ -83,6 +94,12 @@ jobs:
   # ── Linux .deb ───────────────────────────────────────────────────────
   build-linux:
     runs-on: ubuntu-22.04
+    env:
+      APP_NAME: ActivePulse
+      APP_VERSION: 1.0.0
+      APP_DESCRIPTION: ActivePulse Desktop Activity Agent
+      APP_VENDOR: Aress Software
+      MAIN_CLASS: com.activepulse.agent.ActivePulseApplication
     steps:
       - uses: actions/checkout@v4
 
@@ -101,7 +118,9 @@ jobs:
         run: mvn clean package -B
 
       - name: Prepare JAR
-        run: cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
+        run: |
+          mkdir -p dist
+          cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
 
       - name: Create DEB Installer
         run: |
@@ -135,6 +154,12 @@ jobs:
   # ── macOS .dmg ───────────────────────────────────────────────────────
   build-mac-arm:
     runs-on: macos-latest
+    env:
+      APP_NAME: ActivePulse
+      APP_VERSION: 1.0.0
+      APP_DESCRIPTION: ActivePulse Desktop Activity Agent
+      APP_VENDOR: Aress Software
+      MAIN_CLASS: com.activepulse.agent.ActivePulseApplication
 
     steps:
       - uses: actions/checkout@v4
@@ -151,27 +176,44 @@ jobs:
 
       - name: Prepare JAR
         run: |
-          ls target
+          mkdir -p dist
           cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
 
       - name: Create DMG (ARM)
         run: |
           jpackage \
-            --name ServiceProcess-arm64 \
+            --name "$APP_NAME" \
+            --app-version "$APP_VERSION" \
+            --description "$APP_DESCRIPTION" \
+            --vendor "$APP_VENDOR" \
             --input target \
             --main-jar app.jar \
+            --main-class "$MAIN_CLASS" \
             --type dmg \
             --dest dist \
-            --icon src/main/resources/tray-icon.icns
+            --icon src/main/resources/tray-icon.png \
+            --mac-package-name "$APP_NAME" \
+            --mac-package-identifier com.activepulse.agent \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --java-options "-Duser.timezone=Asia/Kolkata" \
+            --java-options "-Xms64m" \
+            --java-options "-Xmx256m"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mac-arm64
-          path: dist/*
+          name: ActivePulse-macOS-ARM-${{ env.APP_VERSION }}
+          path: dist/*.dmg
+          retention-days: 30
 
   # ── macOS Intel (.dmg) ───────────────────────────────────────
   build-mac-intel:
-    runs-on: macos-15-intel
+    runs-on: macos-13
+    env:
+      APP_NAME: ActivePulse
+      APP_VERSION: 1.0.0
+      APP_DESCRIPTION: ActivePulse Desktop Activity Agent
+      APP_VENDOR: Aress Software
+      MAIN_CLASS: com.activepulse.agent.ActivePulseApplication
 
     steps:
       - uses: actions/checkout@v4
@@ -188,20 +230,31 @@ jobs:
 
       - name: Prepare JAR
         run: |
-          ls target
+          mkdir -p dist
           cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
 
       - name: Create DMG (Intel)
         run: |
           jpackage \
-            --name ServiceProcess-x64 \
+            --name "$APP_NAME" \
+            --app-version "$APP_VERSION" \
+            --description "$APP_DESCRIPTION" \
+            --vendor "$APP_VENDOR" \
             --input target \
             --main-jar app.jar \
+            --main-class "$MAIN_CLASS" \
             --type dmg \
             --dest dist \
-            --icon src/main/resources/tray-icon.icns
+            --icon src/main/resources/tray-icon.png \
+            --mac-package-name "$APP_NAME" \
+            --mac-package-identifier com.activepulse.agent \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --java-options "-Duser.timezone=Asia/Kolkata" \
+            --java-options "-Xms64m" \
+            --java-options "-Xmx256m"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mac-x64
-          path: dist/*
+          name: ActivePulse-macOS-Intel-${{ env.APP_VERSION }}
+          path: dist/*.dmg
+          retention-days: 30
