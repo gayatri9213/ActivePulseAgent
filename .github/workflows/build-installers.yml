@@ -206,7 +206,7 @@ jobs:
 
   # ── macOS Intel (.dmg) ───────────────────────────────────────
   build-mac-intel:
-    runs-on: macos-13
+    runs-on: macos-15-intel
     env:
       APP_NAME: ActivePulse
       APP_VERSION: 1.0.0
