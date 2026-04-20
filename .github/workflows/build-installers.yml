@@ -59,6 +59,7 @@ jobs:
           # Use full path to jpackage
           $javaHome = (Get-Command java).Source | Split-Path -Parent | Split-Path -Parent
           $jpackageExe = Join-Path $javaHome "bin\jpackage.exe"
+          Write-Host "JAVA HOME USED: $javaHome"   # ✅ ADD THIS
           Write-Host "Using jpackage: $jpackageExe"
           & $jpackageExe `
             --type exe `
@@ -71,6 +72,7 @@ jobs:
             --main-class "com.activepulse.agent.ActivePulseApplication" `
             --dest "target\setup" `
             --temp "C:\ap-build\jpackage-tmp" `
+            --runtime-image "$javaHome" `
             --java-options "-Djava.awt.headless=false" `
             --java-options "-Dfile.encoding=UTF-8" `
             --java-options "-Xms64m" `
