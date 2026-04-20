@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+
+    <!-- Dark rounded background — visible on both light + dark taskbars -->
+    <rect width="256" height="256" rx="52" ry="52" fill="#0f172a"/>
+
+    <!-- Subtle inner border for definition on light taskbars -->
+    <rect width="256" height="256" rx="52" ry="52"
+          fill="none" stroke="#1e3a5f" stroke-width="6"/>
+
+    <!-- ECG / pulse line — bold, high contrast green -->
+    <!-- Designed to stay readable even at 16x16 -->
+    <polyline
+            points="18,128  68,128  88,128  100,80  118,176  134,48  150,200  164,128  188,128  198,100  210,156  220,128  238,128"
+            fill="none"
+            stroke="#22c55e"
+            stroke-width="18"
+            stroke-linecap="round"
+            stroke-linejoin="round"/>
+
+    <!-- Status dot — bottom right -->
+    <circle cx="210" cy="200" r="28" fill="#0f172a"/>
+    <circle cx="210" cy="200" r="20" fill="#22c55e"/>
+    <circle cx="210" cy="200" r="10" fill="#15803d"/>
+
+</svg>

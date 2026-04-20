@@ -1,0 +1,207 @@
+
+name: Build Installers
+
+on:
+  push:
+    branches: [ main ]   # triggers on both branches
+  workflow_dispatch:            # also trigger manually from GitHub UI
+
+jobs:
+
+  # ── Windows .exe ─────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'       
+
+      - name: Set up Maven 3.9.13
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.9.13
+
+      - name: Verify versions
+        run: |
+          java --version
+          mvn --version
+      - name: Install WiX Toolset
+        run: |
+          choco install wixtoolset -y
+          echo "C:\Program Files (x86)\WiX Toolset v3.11\bin" >> $env:GITHUB_PATH
+      - name: Build JAR
+        run: mvn clean package -q
+
+      - name: Build Windows .exe installer
+        run: |
+          $env:TEMP = "C:\ap-tmp"
+          $env:TMP  = "C:\ap-tmp"
+          New-Item -ItemType Directory -Force -Path "C:\ap-tmp"          | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\ap-build\input"  | Out-Null
+          New-Item -ItemType Directory -Force -Path "target\setup"       | Out-Null
+          Copy-Item "target\active-pulse-0.0.1-SNAPSHOT.jar" "C:\ap-build\input\"
+          $iconArg = @()
+          if (Test-Path "src\main\resources\tray-icon.ico") {
+            Copy-Item "src\main\resources\tray-icon.ico" "C:\ap-build\"
+            $iconArg = @("--icon", "C:\ap-build\tray-icon.ico")
+          }
+          & jpackage `
+            --type exe `
+            --name "ActivePulse" `
+            --app-version "1.0.0" `
+            --description "Service Process" `
+            --vendor "Aress Software" `
+            --input "C:\ap-build\input" `
+            --main-jar "active-pulse-0.0.1-SNAPSHOT.jar" `
+            --main-class "com.activepulse.agent.ActivePulseApplication" `
+            --dest "target\setup" `
+            --temp "C:\ap-build\jpackage-tmp" `
+            --java-options "-Djava.awt.headless=false" `
+            --java-options "-Dfile.encoding=UTF-8" `
+            --java-options "-Xms64m" `
+            --java-options "-Xmx256m" `
+            --java-options "-Duser.timezone=Asia/Kolkata" `
+            @iconArg `
+            --win-dir-chooser `
+            --win-menu `
+            --win-menu-group "ActivePulse" `
+            --win-shortcut `
+            --win-shortcut-prompt `
+            --win-per-machine-install `
+            --win-upgrade-uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ActivePulse-Windows-1.0.0
+          path: target/setup/ActivePulse-1.0.0.exe
+          retention-days: 30
+
+  # ── Linux .deb ───────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install required tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot dpkg-dev
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Build JAR
+        run: mvn clean package -B
+
+      - name: Prepare JAR
+        run: cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
+
+      - name: Create DEB Installer
+        run: |
+          jpackage \
+            --name "$APP_NAME" \
+            --app-version "$APP_VERSION" \
+            --description "$APP_DESCRIPTION" \
+            --vendor "$APP_VENDOR" \
+            --input target \
+            --main-jar app.jar \
+            --main-class "$MAIN_CLASS" \
+            --type deb \
+            --dest dist \
+            --icon src/main/resources/tray-icon.png \
+            --linux-shortcut \
+            --linux-menu-group "Utility" \
+            --linux-app-category "utility" \
+            --linux-deb-maintainer "support@aressindia.net" \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --java-options "-Duser.timezone=Asia/Kolkata" \
+            --java-options "-Xms64m" \
+            --java-options "-Xmx256m"
+
+      - name: Upload Linux DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: ActivePulse-Linux-${{ env.APP_VERSION }}
+          path: dist/*.deb
+          retention-days: 30
+
+  # ── macOS .dmg ───────────────────────────────────────────────────────
+  build-mac-arm:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (ARM)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: aarch64
+
+      - name: Build JAR
+        run: mvn clean package
+
+      - name: Prepare JAR
+        run: |
+          ls target
+          cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
+
+      - name: Create DMG (ARM)
+        run: |
+          jpackage \
+            --name ServiceProcess-arm64 \
+            --input target \
+            --main-jar app.jar \
+            --type dmg \
+            --dest dist \
+            --icon src/main/resources/tray-icon.icns
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64
+          path: dist/*
+
+  # ── macOS Intel (.dmg) ───────────────────────────────────────
+  build-mac-intel:
+    runs-on: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (x64)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: x64
+
+      - name: Build JAR
+        run: mvn clean package
+
+      - name: Prepare JAR
+        run: |
+          ls target
+          cp target/active-pulse-0.0.1-SNAPSHOT.jar target/app.jar
+
+      - name: Create DMG (Intel)
+        run: |
+          jpackage \
+            --name ServiceProcess-x64 \
+            --input target \
+            --main-jar app.jar \
+            --type dmg \
+            --dest dist \
+            --icon src/main/resources/tray-icon.icns
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-x64
+          path: dist/*
