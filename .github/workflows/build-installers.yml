@@ -82,7 +82,6 @@ jobs:
             --win-menu-group "ActivePulse" `
             --win-shortcut `
             --win-shortcut-prompt `
-            --win-per-machine-install `
             --win-upgrade-uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
