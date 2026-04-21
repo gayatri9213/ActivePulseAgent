@@ -103,7 +103,6 @@ jobs:
             --main-jar $mainJar `
             --main-class "${{ env.MAIN_CLASS }}" `
             --dest dist `
-            --win-per-user-install:false `
             --win-dir-chooser `
             --win-menu `
             --win-menu-group "${{ env.APP_VENDOR }}" `
