@@ -48,6 +48,12 @@ public final class Main {
         // Logback reads ${activepulse.logs.dir} at init time.
         Path logsDir = resolveLogsDirEarly();
         System.setProperty("activepulse.logs.dir", logsDir.toString());
+        // Step 1b — Redirect JNativeHook's native lib extraction to a writable
+        //           per-user directory. Must be set before GlobalScreen is loaded.
+        java.nio.file.Path nativeDir = logsDir.getParent().resolve("native");
+        try { java.nio.file.Files.createDirectories(nativeDir); } catch (Exception ignored) {}
+        System.setProperty("jnativehook.lib.path", nativeDir.toString());
+
 
         // Step 2: Config
         EnvConfig.load();

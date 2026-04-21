@@ -35,6 +35,15 @@ public final class KeyboardMouseTracker
     public synchronized void start() {
         if (registered) return;
         try {
+
+            // Tell JNativeHook to extract its native .dll/.so/.dylib to a
+            // per-user writable directory. Without this, per-machine installs
+            // (under C:\Program Files\...) fail with "Access is denied" because
+            // JNativeHook's default is to drop the DLL next to its JAR.
+            java.nio.file.Path nativeDir = com.activepulse.agent.util.PathResolver
+                    .dataDir().resolve("native");
+            try { java.nio.file.Files.createDirectories(nativeDir); } catch (Exception ignored) {}
+            System.setProperty("jnativehook.lib.path", nativeDir.toString());
             // Silence JNativeHook's java.util.logging output
             java.util.logging.Logger l = java.util.logging.Logger.getLogger(GlobalScreen.class.getPackage().getName());
             l.setLevel(Level.WARNING);

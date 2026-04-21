@@ -99,6 +99,7 @@ jobs:
             --app-version $iv `
             --vendor "${{ env.APP_VENDOR }}" `
             --description "${{ env.APP_DESCRIPTION }}" `
+            --icon src/main/resources/tray-icon.ico `
             --input input `
             --main-jar $mainJar `
             --main-class "${{ env.MAIN_CLASS }}" `
@@ -152,6 +153,7 @@ jobs:
             --app-version "$IV" \
             --vendor "${APP_VENDOR}" \
             --description "${APP_DESCRIPTION}" \
+            --icon src/main/resources/tray-icon.png \
             --input input \
             --main-jar "$MAIN_JAR" \
             --main-class "${MAIN_CLASS}" \
@@ -203,6 +205,7 @@ jobs:
             --app-version "$IV" \
             --vendor "${APP_VENDOR}" \
             --description "${APP_DESCRIPTION}" \
+            --icon src/main/resources/tray-icon.icns \
             --input input \
             --main-jar "$MAIN_JAR" \
             --main-class "${MAIN_CLASS}" \
@@ -253,6 +256,7 @@ jobs:
             --app-version "$IV" \
             --vendor "${APP_VENDOR}" \
             --description "${APP_DESCRIPTION}" \
+            --icon src/main/resources/tray-icon.icns \
             --input input \
             --main-jar "$MAIN_JAR" \
             --main-class "${MAIN_CLASS}" \
