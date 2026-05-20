@@ -4,56 +4,186 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import oshi.SystemInfo;
 import oshi.hardware.ComputerSystem;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.UUID;
-
-/**
- * Stable device identifier. Prefers hardware UUID (via OSHI), falls back to
- * a generated UUID stored in {dataDir}/device-id.
- */
 public final class DeviceIdProvider {
-
     private static final Logger log = LoggerFactory.getLogger(DeviceIdProvider.class);
     private static volatile String cached;
 
-    private DeviceIdProvider() {}
+    private DeviceIdProvider() {
+    }
 
     public static String get() {
-        if (cached != null) return cached;
+        if (cached != null) {
+            return cached;
+        }
         synchronized (DeviceIdProvider.class) {
-            if (cached != null) return cached;
+            if (cached != null) {
+                return cached;
+            }
             cached = resolve();
             return cached;
         }
     }
 
     private static String resolve() {
-        // 1. Try hardware UUID
         try {
-            ComputerSystem cs = new SystemInfo().getHardware().getComputerSystem();
-            String hwUuid = cs.getHardwareUUID();
-            if (hwUuid != null && !hwUuid.isBlank() && !hwUuid.equalsIgnoreCase("unknown")) {
-                return "DEV-" + hwUuid.toUpperCase();
+            String osName = System.getProperty("os.name")
+                    .toLowerCase();
+            /*
+             * Mac-specific:
+             * Prefer Serial Number because it is stable
+             * across reinstalls and machine reboots.
+             */
+            if (osName.contains("mac")) {
+                String serialNumber = getMacSerialNumber();
+                if (isValid(serialNumber)) {
+                    log.info(
+                            "Using Mac Serial Number as deviceId: {}",
+                            serialNumber);
+                    return "DEV-" +
+                            serialNumber.toUpperCase();
+                }
+                log.warn(
+                        "Mac Serial Number unavailable. Trying Hardware UUID...");
             }
-        } catch (Throwable t) {
-            log.warn("OSHI hardware UUID unavailable: {}", t.getMessage());
+
+            /*
+             * Hardware UUID for all platforms
+             */
+            ComputerSystem cs = new SystemInfo()
+                    .getHardware()
+                    .getComputerSystem();
+
+            String hardwareUuid = cs.getHardwareUUID();
+
+            if (isValid(hardwareUuid)) {
+
+                log.info(
+                        "Using Hardware UUID as deviceId: {}",
+                        hardwareUuid);
+
+                return "DEV-" +
+                        hardwareUuid.toUpperCase();
+            }
+
+        } catch (Exception e) {
+
+            log.error(
+                    "Error while resolving deviceId: {}",
+                    e.getMessage(),
+                    e);
         }
 
-        // 2. File-backed UUID
-        Path file = PathResolver.dataDir().resolve("device-id");
+        /*
+         * No random UUID generation
+         * No file-based fallback
+         */
+        throw new RuntimeException(
+                "Unable to determine a stable device ID for this machine.");
+    }
+
+    private static String getMacSerialNumber() {
+
         try {
-            if (Files.isRegularFile(file)) {
-                String existing = Files.readString(file).trim();
-                if (!existing.isBlank()) return existing;
+
+            Process process = Runtime.getRuntime().exec(
+                    new String[] {
+                            "sh",
+                            "-c",
+                            "system_profiler SPHardwareDataType | awk '/Serial Number/ {print $NF}'"
+                    });
+
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(
+                            process.getInputStream()));
+
+            String serialNumber = reader.readLine();
+
+            process.waitFor();
+
+            if (isValid(serialNumber)) {
+                return serialNumber.trim();
             }
-            String generated = "DEV-" + UUID.randomUUID().toString().toUpperCase();
-            Files.writeString(file, generated);
-            return generated;
+
         } catch (Exception e) {
-            log.warn("Failed to persist device-id: {}", e.getMessage());
-            return "DEV-" + UUID.randomUUID().toString().toUpperCase();
+
+            log.warn(
+                    "Failed to fetch Mac Serial Number: {}",
+                    e.getMessage());
         }
+
+        return null;
+    }
+
+    private static boolean isValid(String value) {
+
+        return value != null
+                && !value.isBlank()
+                && !"unknown".equalsIgnoreCase(value)
+                && !"null".equalsIgnoreCase(value);
     }
 }
+
+// package com.activepulse.agent.util;
+
+// import org.slf4j.Logger;
+// import org.slf4j.LoggerFactory;
+// import oshi.SystemInfo;
+// import oshi.hardware.ComputerSystem;
+
+// import java.nio.file.Files;
+// import java.nio.file.Path;
+// import java.util.UUID;
+
+// /**
+// * Stable device identifier. Prefers hardware UUID (via OSHI), falls back to
+// * a generated UUID stored in {dataDir}/device-id.
+// */
+// public final class DeviceIdProvider {
+
+// private static final Logger log =
+// LoggerFactory.getLogger(DeviceIdProvider.class);
+// private static volatile String cached;
+
+// private DeviceIdProvider() {}
+
+// public static String get() {
+// if (cached != null) return cached;
+// synchronized (DeviceIdProvider.class) {
+// if (cached != null) return cached;
+// cached = resolve();
+// return cached;
+// }
+// }
+
+// private static String resolve() {
+// // 1. Try hardware UUID
+// try {
+// ComputerSystem cs = new SystemInfo().getHardware().getComputerSystem();
+// String hwUuid = cs.getHardwareUUID();
+// if (hwUuid != null && !hwUuid.isBlank() &&
+// !hwUuid.equalsIgnoreCase("unknown")) {
+// return "DEV-" + hwUuid.toUpperCase();
+// }
+// } catch (Throwable t) {
+// log.warn("OSHI hardware UUID unavailable: {}", t.getMessage());
+// }
+
+// // 2. File-backed UUID
+// Path file = PathResolver.dataDir().resolve("device-id");
+// try {
+// if (Files.isRegularFile(file)) {
+// String existing = Files.readString(file).trim();
+// if (!existing.isBlank()) return existing;
+// }
+// String generated = "DEV-" + UUID.randomUUID().toString().toUpperCase();
+// Files.writeString(file, generated);
+// return generated;
+// } catch (Exception e) {
+// log.warn("Failed to persist device-id: {}", e.getMessage());
+// return "DEV-" + UUID.randomUUID().toString().toUpperCase();
+// }
+// }
+// }
