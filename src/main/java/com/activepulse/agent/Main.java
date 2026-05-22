@@ -11,6 +11,7 @@ import com.activepulse.agent.sync.SyncManager;
 import com.activepulse.agent.util.EnvConfig;
 import com.activepulse.agent.util.OsType;
 import com.activepulse.agent.util.PathResolver;
+import com.activepulse.agent.util.MachineInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,15 +26,16 @@ import java.util.concurrent.CountDownLatch;
  * ActivePulse Agent entry point.
  *
  * Boot sequence:
- *   1. Configure logback log directory (per-user, writable)
- *   2. Load agent.env
- *   3. Acquire single-instance lock
- *   4. Init DatabaseManager (creates schema)
- *   5. Resolve AppConfigManager (triggers AD-user detection on Windows)
- *   6. Register autostart (HKCU on Windows, LaunchAgent on macOS, .desktop on Linux)
- *   7. Start KeyboardMouseTracker (JNativeHook)
- *   8. Start JobScheduler (activity/strokes/screenshots/sync)
- *   9. Park main thread until shutdown signal
+ * 1. Configure logback log directory (per-user, writable)
+ * 2. Load agent.env
+ * 3. Acquire single-instance lock
+ * 4. Init DatabaseManager (creates schema)
+ * 5. Resolve AppConfigManager (triggers AD-user detection on Windows)
+ * 6. Register autostart (HKCU on Windows, LaunchAgent on macOS, .desktop on
+ * Linux)
+ * 7. Start KeyboardMouseTracker (JNativeHook)
+ * 8. Start JobScheduler (activity/strokes/screenshots/sync)
+ * 9. Park main thread until shutdown signal
  *
  * Shutdown hook flushes the in-progress activity session, stops everything,
  * and triggers a final sync to ensure no data is lost.
@@ -49,11 +51,13 @@ public final class Main {
         Path logsDir = resolveLogsDirEarly();
         System.setProperty("activepulse.logs.dir", logsDir.toString());
         // Step 1b — Redirect JNativeHook's native lib extraction to a writable
-        //           per-user directory. Must be set before GlobalScreen is loaded.
+        // per-user directory. Must be set before GlobalScreen is loaded.
         java.nio.file.Path nativeDir = logsDir.getParent().resolve("native");
-        try { java.nio.file.Files.createDirectories(nativeDir); } catch (Exception ignored) {}
+        try {
+            java.nio.file.Files.createDirectories(nativeDir);
+        } catch (Exception ignored) {
+        }
         System.setProperty("jnativehook.lib.path", nativeDir.toString());
-
 
         // Step 2: Config
         EnvConfig.load();
@@ -66,6 +70,14 @@ public final class Main {
         log.info("║  LogsDir: {}", logsDir);
         log.info("║  DataDir: {}", PathResolver.dataDir());
         log.info("╚═══════════════════════════════════════════════╝");
+
+        String localIp = MachineInfo.getLocalIp();
+        String publicIp = MachineInfo.getPublicIp();
+        String location = MachineInfo.getLocation();
+
+        log.info("Machine Local IP : {}", localIp);
+        log.info("Machine Public IP: {}", publicIp);
+        log.info("Machine Location : {}", location);
 
         // Step 3: Single instance
         SingleInstanceLock lock = new SingleInstanceLock();
@@ -81,7 +93,7 @@ public final class Main {
             AppConfigManager cfg = AppConfigManager.getInstance();
             DatabaseManager.getInstance().setConfig("username", cfg.getUsername());
             DatabaseManager.getInstance().setConfig("deviceId", cfg.getDeviceId());
-            DatabaseManager.getInstance().setConfig("osName",    OsType.displayName());
+            DatabaseManager.getInstance().setConfig("osName", OsType.displayName());
             DatabaseManager.getInstance().setConfig("userSource", cfg.getUserSource());
 
             // Step 6: Autostart
@@ -107,25 +119,38 @@ public final class Main {
                 log.info("Shutdown signal received — cleaning up...");
                 try {
                     scheduler.stop();
-                } catch (Throwable t) { log.warn("Scheduler stop failed: {}", t.getMessage()); }
+                } catch (Throwable t) {
+                    log.warn("Scheduler stop failed: {}", t.getMessage());
+                }
 
                 try {
                     KeyboardMouseTracker.getInstance().stop();
-                } catch (Throwable t) { log.warn("KM tracker stop failed: {}", t.getMessage()); }
+                } catch (Throwable t) {
+                    log.warn("KM tracker stop failed: {}", t.getMessage());
+                }
 
                 try {
                     ActivitySessionManager.getInstance().flushCurrent();
-                } catch (Throwable t) { log.warn("Activity flush failed: {}", t.getMessage()); }
+                } catch (Throwable t) {
+                    log.warn("Activity flush failed: {}", t.getMessage());
+                }
 
                 try {
                     SyncManager.getInstance().syncBeforeShutdown();
-                } catch (Throwable t) { log.warn("Final sync failed: {}", t.getMessage()); }
+                } catch (Throwable t) {
+                    log.warn("Final sync failed: {}", t.getMessage());
+                }
 
                 try {
                     DatabaseManager.getInstance().shutdown();
-                } catch (Throwable t) { log.warn("DB close failed: {}", t.getMessage()); }
+                } catch (Throwable t) {
+                    log.warn("DB close failed: {}", t.getMessage());
+                }
 
-                try { lock.release(); } catch (Throwable ignored) {}
+                try {
+                    lock.release();
+                } catch (Throwable ignored) {
+                }
 
                 SHUTDOWN.countDown();
                 log.info("Agent stopped.");
@@ -149,7 +174,7 @@ public final class Main {
      */
     private static Path resolveLogsDirEarly() {
         String home = System.getProperty("user.home");
-        String os   = System.getProperty("os.name", "").toLowerCase();
+        String os = System.getProperty("os.name", "").toLowerCase();
         Path base;
 
         if (os.contains("win")) {
@@ -172,22 +197,28 @@ public final class Main {
         } catch (IOException e) {
             // Fallback: temp dir. Don't use System.err — not guaranteed visible on Windows.
             logs = Paths.get(System.getProperty("java.io.tmpdir"), "activepulse-logs");
-            try { Files.createDirectories(logs); } catch (Exception ignored) {}
+            try {
+                Files.createDirectories(logs);
+            } catch (Exception ignored) {
+            }
         }
         return logs;
     }
 
     /**
-     * Force Logback to re-read its configuration now that activepulse.logs.dir is set.
+     * Force Logback to re-read its configuration now that activepulse.logs.dir is
+     * set.
      * Uses reflection so we don't pull ch.qos.logback classes at load time, which
      * would themselves trigger Logback init before the system property is set.
      */
     private static void reinitLogback() {
         try {
-            // org.slf4j.LoggerFactory.getILoggerFactory() returns a LoggerContext on Logback
+            // org.slf4j.LoggerFactory.getILoggerFactory() returns a LoggerContext on
+            // Logback
             Object factory = LoggerFactory.getILoggerFactory();
             Class<?> loggerContextCls = Class.forName("ch.qos.logback.classic.LoggerContext");
-            if (!loggerContextCls.isInstance(factory)) return;
+            if (!loggerContextCls.isInstance(factory))
+                return;
 
             // factory.reset()
             loggerContextCls.getMethod("reset").invoke(factory);
@@ -207,6 +238,5 @@ public final class Main {
             System.err.println("Logback reinit failed: " + t.getMessage());
         }
     }
-
 
 }

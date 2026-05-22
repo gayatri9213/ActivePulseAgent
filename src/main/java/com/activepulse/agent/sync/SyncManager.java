@@ -40,6 +40,9 @@ public final class SyncManager {
     private static final long THRESHOLD_BYTES  = 10L * 1024 * 1024;
     private static final long CHUNK_SIZE_BYTES =  5L * 1024 * 1024;
 
+    private static final int MAX_ACTIVITY_ITEMS = 5000;
+private static final int MAX_STROKE_ITEMS = 5000;
+
     private final ObjectMapper mapper = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
     private final HttpClient   http   = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(15))
@@ -328,35 +331,147 @@ public final class SyncManager {
 
     // ─── POST /api/sync/data ─────────────────────────────────────────
 
+    // private boolean postDataPayload(Map<String, Object> payload, String syncId) {
+    //     try {
+    //         String json = mapper.writeValueAsString(payload);
+    //         String url  = baseUrl() + "/api/sync/data";
+
+    //         HttpRequest req = HttpRequest.newBuilder()
+    //                 .uri(URI.create(url))
+    //                 .timeout(Duration.ofSeconds(30))
+    //                 .header("Content-Type", "application/json")
+    //                 .POST(BodyPublishers.ofString(json))
+    //                 .build();
+
+    //         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+    //         int status = resp.statusCode();
+    //         log.debug("  Outgoing JSON: {}", json);
+
+    //         log.info("  POST /api/sync/data -> HTTP {} body={}", status, truncate(resp.body(), 200));
+
+    //         if (status == 200) return true;
+    //         if (status == 400) {
+    //             log.warn("  Validation error - check syncId/deviceId/userId.");
+    //             return false;
+    //         }
+    //         return false;
+    //     } catch (Exception e) {
+    //         log.error("  postDataPayload error: {}", e.getMessage());
+    //         return false;
+    //     }
+    // }
+
     private boolean postDataPayload(Map<String, Object> payload, String syncId) {
-        try {
-            String json = mapper.writeValueAsString(payload);
-            String url  = baseUrl() + "/api/sync/data";
+    try {
+        List<Map<String, Object>> activityLog =
+                (List<Map<String, Object>>) payload.getOrDefault(
+                        "activityLog",
+                        Collections.emptyList());
+
+        List<Map<String, Object>> strokes =
+                (List<Map<String, Object>>) payload.getOrDefault(
+                        "keyboardMouseStrokes",
+                        Collections.emptyList());
+
+        int activityChunks =
+                (int) Math.ceil((double) activityLog.size() / MAX_ACTIVITY_ITEMS);
+
+        int strokeChunks =
+                (int) Math.ceil((double) strokes.size() / MAX_STROKE_ITEMS);
+
+        int totalChunks = Math.max(
+                Math.max(activityChunks, strokeChunks),
+                1
+        );
+
+        log.info("Splitting sync into {} requests", totalChunks);
+
+        for (int i = 0; i < totalChunks; i++) {
+
+            int activityStart = i * MAX_ACTIVITY_ITEMS;
+            int activityEnd = Math.min(
+                    activityStart + MAX_ACTIVITY_ITEMS,
+                    activityLog.size()
+            );
+
+            int strokeStart = i * MAX_STROKE_ITEMS;
+            int strokeEnd = Math.min(
+                    strokeStart + MAX_STROKE_ITEMS,
+                    strokes.size()
+            );
+
+            List<Map<String,Object>> activityChunk =
+                    activityStart < activityLog.size()
+                            ? activityLog.subList(activityStart, activityEnd)
+                            : Collections.emptyList();
+
+            List<Map<String,Object>> strokeChunk =
+                    strokeStart < strokes.size()
+                            ? strokes.subList(strokeStart, strokeEnd)
+                            : Collections.emptyList();
+
+            Map<String,Object> chunkPayload =
+                    new LinkedHashMap<>(payload);
+
+            chunkPayload.put(
+                    "syncId",
+                    syncId + "-PART-" + (i + 1)
+            );
+
+            chunkPayload.put(
+                    "activityLog",
+                    activityChunk
+            );
+
+            chunkPayload.put(
+                    "keyboardMouseStrokes",
+                    strokeChunk
+            );
+
+            String json = mapper.writeValueAsString(chunkPayload);
 
             HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
+                    .uri(URI.create(baseUrl() + "/api/sync/data"))
                     .timeout(Duration.ofSeconds(30))
                     .header("Content-Type", "application/json")
                     .POST(BodyPublishers.ofString(json))
                     .build();
 
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            int status = resp.statusCode();
-            log.debug("  Outgoing JSON: {}", json);
+            HttpResponse<String> resp =
+                    http.send(
+                            req,
+                            HttpResponse.BodyHandlers.ofString()
+                    );
 
-            log.info("  POST /api/sync/data -> HTTP {} body={}", status, truncate(resp.body(), 200));
+            log.info(
+                    "POST /api/sync/data chunk {}/{} → HTTP {}",
+                    (i + 1),
+                    totalChunks,
+                    resp.statusCode()
+            );
 
-            if (status == 200) return true;
-            if (status == 400) {
-                log.warn("  Validation error - check syncId/deviceId/userId.");
+            if (resp.statusCode() != 200) {
+                log.warn(
+                        "Chunk {} failed: {}",
+                        (i + 1),
+                        truncate(resp.body(), 300)
+                );
                 return false;
             }
-            return false;
-        } catch (Exception e) {
-            log.error("  postDataPayload error: {}", e.getMessage());
-            return false;
         }
+
+        return true;
+
+    } catch (Exception e) {
+        log.error(
+                "postDataPayload error: {}",
+                e.getMessage(),
+                e
+        );
+        return false;
     }
+}
+
 
     // ─── Screenshot ZIP + upload ─────────────────────────────────────
 
