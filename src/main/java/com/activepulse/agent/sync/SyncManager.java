@@ -3,6 +3,7 @@ package com.activepulse.agent.sync;
 import com.activepulse.agent.db.DatabaseManager;
 import com.activepulse.agent.monitor.AppConfigManager;
 import com.activepulse.agent.util.EnvConfig;
+import com.activepulse.agent.util.MachineInfo;
 import com.activepulse.agent.util.OsType;
 import com.activepulse.agent.util.TimeUtil;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -223,21 +224,29 @@ private static final int MAX_STROKE_ITEMS = 5000;
             AppConfigManager cfg = AppConfigManager.getInstance();
             String deviceId = readConfig(conn, "deviceId", cfg.getDeviceId());
             String osType   = normalizeOs(readConfig(conn, "osName", OsType.displayName()));
+            Map<String, Object> location = MachineInfo.getLocationPayload();
 
-            var p = new LinkedHashMap<String, Object>();
-            p.put("syncId",               syncId);
-            p.put("deviceId",             deviceId);
-            p.put("syncStartTime",        syncStart);
-            p.put("syncEndTime",          TimeUtil.nowIST());
-            p.put("sessionStartTime",     readConfig(conn, "sessionStart", syncStart));
-            p.put("sessionEndTime",       TimeUtil.nowIST());
-            p.put("userId",               userId());
-            p.put("organizationId",       orgId());
-            p.put("agentVersion",         agentVer());
-            p.put("osType",               osType);
-            p.put("activityLog",          activityLog);
-            p.put("keyboardMouseStrokes", strokes);
+var p = new LinkedHashMap<String, Object>();
+p.put("syncId",               syncId);
+p.put("deviceId",             deviceId);
+p.put("syncStartTime",        syncStart);
+p.put("syncEndTime",          TimeUtil.nowIST());
+p.put("sessionStartTime",     readConfig(conn, "sessionStart", syncStart));
+p.put("sessionEndTime",       TimeUtil.nowIST());
+p.put("userId",               userId());
+p.put("organizationId",       orgId());
+p.put("agentVersion",         agentVer());
+p.put("osType",               osType);
+p.put("location",             location);
+p.put("activityLog",          activityLog);
+p.put("keyboardMouseStrokes", strokes);
 
+log.info("  Sync location -- city: {}, lat: {}, lng: {}, privateIp: {}, publicIp: {}",
+        location.get("city"),
+        location.get("latitude"),
+        location.get("longitude"),
+        location.get("privateIp"),
+        location.get("publicIp"));
             log.info("  Payload built -- activity rows: {}, stroke rows: {}",
                     activityLog.size(), strokes.size());
             return p;

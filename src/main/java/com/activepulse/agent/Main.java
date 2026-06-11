@@ -71,14 +71,7 @@ public final class Main {
         log.info("║  DataDir: {}", PathResolver.dataDir());
         log.info("╚═══════════════════════════════════════════════╝");
 
-        String localIp = MachineInfo.getLocalIp();
-        String publicIp = MachineInfo.getPublicIp();
-        String location = MachineInfo.getLocation();
-
-        log.info("Machine Local IP : {}", localIp);
-        log.info("Machine Public IP: {}", publicIp);
-        log.info("Machine Location : {}", location);
-
+   
         // Step 3: Single instance
         SingleInstanceLock lock = new SingleInstanceLock();
         if (!lock.acquire()) {
