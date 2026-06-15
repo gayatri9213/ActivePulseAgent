@@ -1,5 +1,5 @@
 package com.activepulse.agent;
-
+import com.activepulse.agent.WatchdogMode;
 import com.activepulse.agent.autostart.AutostartFactory;
 import com.activepulse.agent.autostart.AutostartManager;
 import com.activepulse.agent.db.DatabaseManager;
@@ -11,7 +11,6 @@ import com.activepulse.agent.sync.SyncManager;
 import com.activepulse.agent.util.EnvConfig;
 import com.activepulse.agent.util.OsType;
 import com.activepulse.agent.util.PathResolver;
-import com.activepulse.agent.util.MachineInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +45,19 @@ public final class Main {
     private static final CountDownLatch SHUTDOWN = new CountDownLatch(1);
 
     public static void main(String[] args) {
+
+           // ── Watchdog mode dispatch — MUST be the first thing ──────────────
+    // If launched with --watchdog flag, we don't run normal agent startup.
+    // Instead we become a supervisor that spawns and watches the agent.
+    if (args != null) {
+        for (String arg : args) {
+            if ("--watchdog".equalsIgnoreCase(arg)) {
+                WatchdogMode.run();
+                return;
+            }
+        }
+    }
+    
         // Step 1: Log directory must be set BEFORE any logger is used.
         // Logback reads ${activepulse.logs.dir} at init time.
         Path logsDir = resolveLogsDirEarly();

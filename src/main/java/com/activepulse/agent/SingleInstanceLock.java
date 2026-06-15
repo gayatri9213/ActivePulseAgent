@@ -25,31 +25,68 @@ public final class SingleInstanceLock {
     private FileChannel channel;
     private FileLock lock;
 
-    public boolean acquire() {
-        Path lockFile = PathResolver.lockFile();
-        try {
-            raf = new RandomAccessFile(lockFile.toFile(), "rw");
-            channel = raf.getChannel();
-            lock = channel.tryLock();
-            if (lock == null) {
-                log.warn("Another agent instance is already running for this user. Exiting.");
-                release();
-                return false;
-            }
-            // Write our PID for diagnostics
-            try {
-                long pid = ProcessHandle.current().pid();
-                raf.setLength(0);
-                raf.writeBytes(Long.toString(pid));
-            } catch (IOException ignored) {}
-            log.info("Single-instance lock acquired at {}", lockFile);
-            return true;
-        } catch (Throwable t) {
-            log.error("Failed to acquire lock: {}", t.getMessage());
+    /**
+ * Acquires the default agent lock (PathResolver.lockFile()).
+ * Use this for normal agent startup.
+ */
+public boolean acquire() {
+    return acquire(PathResolver.lockFile());
+}
+
+/**
+ * Acquires a lock on the specified file. Use this when you want a separate
+ * lock from the default agent lock — e.g. the watchdog uses watchdog.lock
+ * so it doesn't conflict with the child agent's activepulse.lock.
+ */
+public boolean acquire(Path lockFile) {
+    try {
+        raf = new RandomAccessFile(lockFile.toFile(), "rw");
+        channel = raf.getChannel();
+        lock = channel.tryLock();
+        if (lock == null) {
+            log.warn("Another instance is already holding {}. Exiting.", lockFile);
             release();
             return false;
         }
+        try {
+            long pid = ProcessHandle.current().pid();
+            raf.setLength(0);
+            raf.writeBytes(Long.toString(pid));
+        } catch (IOException ignored) {}
+        log.info("Single-instance lock acquired at {}", lockFile);
+        return true;
+    } catch (Throwable t) {
+        log.error("Failed to acquire lock {}: {}", lockFile, t.getMessage());
+        release();
+        return false;
     }
+}
+
+    // public boolean acquire() {
+    //     Path lockFile = PathResolver.lockFile();
+    //     try {
+    //         raf = new RandomAccessFile(lockFile.toFile(), "rw");
+    //         channel = raf.getChannel();
+    //         lock = channel.tryLock();
+    //         if (lock == null) {
+    //             log.warn("Another agent instance is already running for this user. Exiting.");
+    //             release();
+    //             return false;
+    //         }
+    //         // Write our PID for diagnostics
+    //         try {
+    //             long pid = ProcessHandle.current().pid();   
+    //             raf.setLength(0);
+    //             raf.writeBytes(Long.toString(pid));
+    //         } catch (IOException ignored) {}
+    //         log.info("Single-instance lock acquired at {}", lockFile);
+    //         return true;
+    //     } catch (Throwable t) {
+    //         log.error("Failed to acquire lock: {}", t.getMessage());
+    //         release();
+    //         return false;
+    //     }
+    // }
 
     public void release() {
         try { if (lock    != null) lock.release(); }  catch (Exception ignored) {}
