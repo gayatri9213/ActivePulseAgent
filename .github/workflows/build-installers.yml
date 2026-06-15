@@ -16,7 +16,7 @@ on:
 env:
   APP_NAME: ActivePulse
   APP_VENDOR: Aress Software
-  APP_DESCRIPTION: "Service Process"
+  APP_DESCRIPTION: "ActivePulse"
   MAIN_CLASS: com.activepulse.agent.Main
   JAVA_VERSION: '21'
   JAVA_DISTRIBUTION: 'temurin'
