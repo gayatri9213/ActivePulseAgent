@@ -5,21 +5,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Base64;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -28,27 +28,27 @@ import java.util.stream.Collectors;
 
 /**
  * Builds the nested `location` block sent in each sync payload.
- *
+ * <p>
  * Output format:
- *   {
- *     "address":   "Pune",
- *     "latitude":  18.511033,
- *     "longitude": 73.925595,
- *     "city":      "Pune",
- *     "region":    "Maharashtra",
- *     "country":   "India",
- *     "zip":       "411001",
- *     "publicIp":  "114.143.178.130",
- *     "privateIp": "192.168.1.45"
- *   }
- *
+ * {
+ * "address":   "Pune, Maharashtra, India",
+ * "latitude":  18.511033,
+ * "longitude": 73.925595,
+ * "city":      "Pune",
+ * "region":    "Maharashtra",
+ * "country":   "India",
+ * "zip":       "411001",
+ * "publicIp":  "114.143.178.130",
+ * "privateIp": "192.168.1.45"
+ * }
+ * <p>
  * Sources used:
- *   - privateIp:                NetworkInterface enumeration
- *   - latitude / longitude:     Windows Location Services via PowerShell GeoCoordinateWatcher
- *   - city / region / country:  Nominatim reverse geocoding of the precise coords
- *   - publicIp and IP location: IPGeolocation.io public lookup page
- *   - IP-based fallback:        ip-api.com if the public page cannot be parsed
- *
+ * - privateIp:                NetworkInterface enumeration
+ * - latitude / longitude:     Windows Location Services via PowerShell GeoCoordinateWatcher
+ * - city / region / country:  Google Geocoding API (if key configured) or Nominatim fallback
+ * - publicIp and IP location: IPGeolocation.io public lookup page
+ * - IP-based fallback:        ip-api.com if the public page cannot be parsed
+ * <p>
  * Results cached for 10 minutes (2 min if data couldn't be fully resolved).
  */
 public final class MachineInfo {
@@ -69,13 +69,14 @@ public final class MachineInfo {
     private static volatile Map<String, Object> cachedLocation;
     private static volatile Instant cachedAt;
 
-    private MachineInfo() {}
+    private MachineInfo() {
+    }
 
     // ─── Public API ──────────────────────────────────────────────────
 
     /**
      * @return the nested `location` object for the sync payload.
-     *         Never null; missing fields are empty strings or zero values.
+     * Never null; missing fields are empty strings or zero values.
      */
     public static Map<String, Object> getLocationPayload() {
         Instant now = Instant.now();
@@ -100,8 +101,8 @@ public final class MachineInfo {
     public static Map<String, Object> getSyncDetails() {
         Map<String, Object> loc = getLocationPayload();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("privateIp",       loc.get("privateIp"));
-        out.put("publicIp",        loc.get("publicIp"));
+        out.put("privateIp", loc.get("privateIp"));
+        out.put("publicIp", loc.get("publicIp"));
         out.put("locationDetails",
                 loc.get("city") + ", " + loc.get("region") + ", " + loc.get("country"));
         return out;
@@ -111,288 +112,40 @@ public final class MachineInfo {
 
     private static Map<String, Object> buildLocationPayload() {
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("address",   "");
-        result.put("latitude",  0.0);
+        result.put("address", "");
+        result.put("latitude", 0.0);
         result.put("longitude", 0.0);
-        result.put("city",      "");
-        result.put("region",    "");
-        result.put("country",   "");
-        result.put("zip",       "");
-        result.put("publicIp",  "");
+        result.put("city", "");
+        result.put("region", "");
+        result.put("country", "");
+        result.put("zip", "");
+        result.put("publicIp", "");
         result.put("privateIp", getPrivateIp());
 
-        // 1) Precise GPS coordinates from Windows Location Services
-        double[] preciseCoords = getPreciseCoordinates();
-        boolean hasPreciseCoords = preciseCoords != null;
+        WindowsLocation wl = getWindowsLocation();
+        boolean hasPreciseCoords = wl != null;
 
         if (hasPreciseCoords) {
-            result.put("latitude",  preciseCoords[0]);
-            result.put("longitude", preciseCoords[1]);
-            log.info("Precise coordinates from Windows Location Services: {}, {}",
-                    preciseCoords[0], preciseCoords[1]);
-
-            // 2) Reverse-geocode the coords to get city/region/country
-            boolean reverseSuccess = tryReverseGeocode(preciseCoords[0], preciseCoords[1], result);
-            if (!reverseSuccess) {
-                log.warn("Reverse geocoding failed -- precise coords preserved; " +
-                         "city/region will come from IP fallback");
+            result.put("latitude", wl.lat());
+            result.put("longitude", wl.lon());
+            if (!wl.city().isBlank()) {
+                result.put("city", wl.city());
+                result.put("region", wl.state());
+                result.put("country", wl.country());
+                result.put("zip", wl.zip());
+                result.put("address", buildAddress(wl.city(), wl.state(), wl.country()));
+            } else {
+                log.warn("PowerShell reverse-geocode empty -- coords preserved; "
+                        + "city/region will come from IP fallback");
             }
         }
 
-        // 3) IP-based fallback always called to fill in publicIp;
-        //    also overwrites lat/lng/city/etc if precise wasn't available
+        // IP fallback: always sets publicIp; only overwrites lat/lng if no precise fix.
         tryIpFallback(result, !hasPreciseCoords);
-
         return result;
     }
 
-    /**
-     * Reverse-geocodes lat/lng to city/region/country via OpenStreetMap Nominatim.
-     * Updates `result` in place. Returns true if at least the city was resolved.
-     */
-//     private static boolean tryReverseGeocode(double lat, double lon, Map<String, Object> result) {
-//         try {
-//             String url = String.format(
-//                     "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=%f&lon=%f&zoom=14&addressdetails=1",
-//                     lat, lon);
 
-//             // Nominatim usage policy requires a meaningful User-Agent with contact info.
-//             // TODO: replace the email with your real one before deploying.
-//             String userAgent = "ActivePulse/1.0 (contact: support@aress.com)";
-
-//             String response = httpGet(url, userAgent);
-//             if (response == null || response.isBlank()) {
-//                 log.debug("Nominatim returned empty response");
-//                 return false;
-//             }
-
-//             JsonNode root = mapper.readTree(response);
-//             JsonNode address = root.path("address");
-//             if (address.isMissingNode()) {
-//                 log.debug("Nominatim response missing 'address' node");
-//                 return false;
-//             }
-
-//             // Try multiple fields because Nominatim uses different keys depending on area
-//             String city = firstNonEmpty(
-//         address.path("city").asText(""),
-//         address.path("town").asText(""),
-//         address.path("village").asText(""),
-//         address.path("municipality").asText(""),
-//         address.path("suburb").asText(""),
-//         address.path("county").asText(""));
-
-//             if (city.isBlank()) {
-//                 log.warn("Nominatim returned no city/town/village for {},{}", lat, lon);
-//                 return false;
-//             }
-
-//             result.put("city",    city);
-//             result.put("region",  address.path("state").asText(""));
-//             result.put("country", address.path("country").asText(""));
-//             result.put("zip",     address.path("postcode").asText(""));
-//             String fullAddress = root.path("display_name").asText("");
-// result.put("address", fullAddress);
-// log.info("Full Address: {}", fullAddress);
-
-//             log.info("Reverse geocoded {},{} -> {}, {}, {}",
-//                     lat, lon, city, result.get("region"), result.get("country"));
-//             return true;
-
-//         } catch (Exception e) {
-//             log.warn("Reverse geocode failed: {}", e.getMessage());
-//             return false;
-//         }
-//     }
-
-
-        /**
- * Reverse-geocodes lat/lng to city/region/country.
- * Tries Google Geocoding API first (if key configured), falls back to Nominatim.
- * Updates `result` in place. Returns true if at least the city was resolved.
- */
-private static boolean tryReverseGeocode(double lat, double lon, Map<String, Object> result) {
-    // Try Google first if key is configured
-    String apiKey = EnvConfig.get("GOOGLE_GEOCODING_API_KEY", "").trim();
-    if (!apiKey.isBlank()) {
-        if (tryGoogleGeocode(lat, lon, apiKey, result)) {
-            return true;
-        }
-        log.warn("Google Geocoding failed -- falling back to Nominatim");
-    }
-
-    // Fallback: Nominatim (or primary if no Google key)
-    return tryNominatimGeocode(lat, lon, result);
-}
-
-/**
- * Reverse-geocode via Google Maps Geocoding API.
- * Docs: https://developers.google.com/maps/documentation/geocoding/requests-reverse-geocoding
- */
-private static boolean tryGoogleGeocode(double lat, double lon, String apiKey,
-                                         Map<String, Object> result) {
-    try {
-        String url = String.format(
-                "https://maps.googleapis.com/maps/api/geocode/json?latlng=%f,%f&key=%s",
-                lat, lon, URLEncoder.encode(apiKey, StandardCharsets.UTF_8));
-
-        String response = httpGet(url, "ActivePulse/1.0");
-        if (response == null || response.isBlank()) {
-            log.debug("Google Geocoding returned empty response");
-            return false;
-        }
-
-        JsonNode root = mapper.readTree(response);
-        String status = root.path("status").asText("");
-
-        if (!"OK".equals(status)) {
-            // Common error statuses worth logging:
-            // ZERO_RESULTS — coords don't map to any address (e.g. middle of ocean)
-            // OVER_QUERY_LIMIT — you've exceeded your billing quota
-            // REQUEST_DENIED — API key missing/invalid/restricted
-            // INVALID_REQUEST — malformed request
-            log.warn("Google Geocoding status={}, message={}",
-                    status, root.path("error_message").asText(""));
-            return false;
-        }
-
-        JsonNode results = root.path("results");
-        if (!results.isArray() || results.isEmpty()) {
-            log.warn("Google Geocoding returned no results for {},{}", lat, lon);
-            return false;
-        }
-
-        // Google returns results in priority order — the first is the most specific.
-        // We want to find a "locality" (city) result, or use the first one if not found.
-        JsonNode best = results.get(0);
-        for (JsonNode candidate : results) {
-            if (containsType(candidate.path("types"), "locality")) {
-                best = candidate;
-                break;
-            }
-        }
-
-        // Extract address components from the chosen result
-        String city = "", region = "", country = "", postalCode = "";
-        JsonNode components = best.path("address_components");
-        if (components.isArray()) {
-            for (JsonNode component : components) {
-                JsonNode types = component.path("types");
-                String longName = component.path("long_name").asText("");
-                String shortName = component.path("short_name").asText("");
-
-                if (containsType(types, "locality") || containsType(types, "postal_town")) {
-                    city = longName;
-                } else if (containsType(types, "administrative_area_level_1")) {
-                    region = longName;
-                } else if (containsType(types, "country")) {
-                    country = longName;
-                } else if (containsType(types, "postal_code")) {
-                    postalCode = longName;
-                }
-            }
-        }
-
-        // City might be missing for rural areas; try fallbacks
-        if (city.isBlank() && components.isArray()) {
-            for (JsonNode component : components) {
-                JsonNode types = component.path("types");
-                if (containsType(types, "sublocality") ||
-                    containsType(types, "administrative_area_level_2") ||
-                    containsType(types, "administrative_area_level_3")) {
-                    city = component.path("long_name").asText("");
-                    if (!city.isBlank()) break;
-                }
-            }
-        }
-
-        if (city.isBlank()) {
-            log.warn("Google Geocoding returned no city for {},{}: formatted_address={}",
-                    lat, lon, best.path("formatted_address").asText(""));
-            return false;
-        }
-
-        String formattedAddress = best.path("formatted_address").asText(city);
-
-        result.put("city",    city);
-        result.put("region",  region);
-        result.put("country", country);
-        result.put("zip",     postalCode);
-        result.put("address", formattedAddress);
-
-        log.info("Google Geocoded {},{} -> {}, {}, {} (full: {})",
-                lat, lon, city, region, country, formattedAddress);
-        return true;
-
-    } catch (Exception e) {
-        log.warn("Google Geocoding failed: {}", e.getMessage());
-        return false;
-    }
-}
-
-/**
- * Helper to check if a JSON array of strings contains a specific type.
- */
-private static boolean containsType(JsonNode typesArray, String type) {
-    if (!typesArray.isArray()) return false;
-    for (JsonNode t : typesArray) {
-        if (type.equals(t.asText(""))) return true;
-    }
-    return false;
-}
-
-/**
- * Reverse-geocodes lat/lng to city/region/country via OpenStreetMap Nominatim.
- * Used as fallback when Google is not available or fails.
- */
-private static boolean tryNominatimGeocode(double lat, double lon, Map<String, Object> result) {
-    try {
-        String url = String.format(
-                "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=%f&lon=%f&zoom=14&addressdetails=1",
-                lat, lon);
-        String userAgent = "ActivePulse/1.0 (contact: support@aress.com)";
-
-        String response = httpGet(url, userAgent);
-        if (response == null || response.isBlank()) {
-            log.debug("Nominatim returned empty response");
-            return false;
-        }
-
-        JsonNode root = mapper.readTree(response);
-        JsonNode address = root.path("address");
-        if (address.isMissingNode()) {
-            log.debug("Nominatim response missing 'address' node");
-            return false;
-        }
-
-        String city = firstNonEmpty(
-                address.path("city").asText(""),
-                address.path("town").asText(""),
-                address.path("village").asText(""),
-                address.path("municipality").asText(""),
-                address.path("suburb").asText(""),
-                address.path("county").asText(""));
-
-        if (city.isBlank()) {
-            log.warn("Nominatim returned no city for {},{}", lat, lon);
-            return false;
-        }
-
-        result.put("city",    city);
-        result.put("region",  address.path("state").asText(""));
-        result.put("country", address.path("country").asText(""));
-        result.put("zip",     address.path("postcode").asText(""));
-        result.put("address", root.path("display_name").asText(city));
-
-        log.info("Nominatim geocoded {},{} -> {}, {}, {}",
-                lat, lon, city, result.get("region"), result.get("country"));
-        return true;
-
-    } catch (Exception e) {
-        log.warn("Nominatim geocode failed: {}", e.getMessage());
-        return false;
-    }
-}
     /**
      * IP-based location lookup via IPGeolocation.io's public lookup page.
      * Always sets publicIp; only sets lat/lng/city/etc if overwriteCoords is true.
@@ -434,18 +187,18 @@ private static boolean tryNominatimGeocode(double lat, double lon, Map<String, O
             String region = location.path("state_prov").asText("");
             String country = location.path("country_name").asText("");
             if (overwriteCoords) {
-                result.put("city",      city);
-                result.put("region",    region);
-                result.put("country",   country);
-                result.put("zip",       location.path("zipcode").asText(""));
-                result.put("address",   buildAddress(city, region, country));
-                result.put("latitude",  location.path("latitude").asDouble(0.0));
+                result.put("city", city);
+                result.put("region", region);
+                result.put("country", country);
+                result.put("zip", location.path("zipcode").asText(""));
+                result.put("address", buildAddress(city, region, country));
+                result.put("latitude", location.path("latitude").asDouble(0.0));
                 result.put("longitude", location.path("longitude").asDouble(0.0));
             } else if (((String) result.get("city")).isBlank()) {
-                result.put("city",    city);
-                result.put("region",  region);
+                result.put("city", city);
+                result.put("region", region);
                 result.put("country", country);
-                result.put("zip",     location.path("zipcode").asText(""));
+                result.put("zip", location.path("zipcode").asText(""));
                 result.put("address", buildAddress(city, region, country));
             }
 
@@ -477,22 +230,22 @@ private static boolean tryNominatimGeocode(double lat, double lon, Map<String, O
 
             if (overwriteCoords) {
                 String city = node.path("city").asText("");
-                result.put("city",      city);
-                result.put("region",    node.path("regionName").asText(""));
-                result.put("country",   node.path("country").asText(""));
-                result.put("zip",       node.path("zip").asText(""));
-                result.put("address",   city);
-                result.put("latitude",  node.path("lat").asDouble(0.0));
+                result.put("city", city);
+                result.put("region", node.path("regionName").asText(""));
+                result.put("country", node.path("country").asText(""));
+                result.put("zip", node.path("zip").asText(""));
+                result.put("address", city);
+                result.put("latitude", node.path("lat").asDouble(0.0));
                 result.put("longitude", node.path("lon").asDouble(0.0));
                 log.info("Using IP-based location: {}, {}, {} (lat={}, lng={})",
                         city, result.get("region"), result.get("country"),
                         result.get("latitude"), result.get("longitude"));
             } else if (((String) result.get("city")).isBlank()) {
-                // Precise coords are in place, but Nominatim failed; fill in city/region/country from IP
-                result.put("city",    node.path("city").asText(""));
-                result.put("region",  node.path("regionName").asText(""));
+                // Precise coords are in place, but reverse-geocode failed; fill in city/region/country from IP
+                result.put("city", node.path("city").asText(""));
+                result.put("region", node.path("regionName").asText(""));
                 result.put("country", node.path("country").asText(""));
-                result.put("zip",     node.path("zip").asText(""));
+                result.put("zip", node.path("zip").asText(""));
                 result.put("address", node.path("city").asText(""));
                 log.info("Filled city/region/country from IP, preserved precise coords");
             }
@@ -529,195 +282,158 @@ private static boolean tryNominatimGeocode(double lat, double lon, Map<String, O
 
     /**
      * Calls Windows Location Services via PowerShell to get precise GPS coordinates.
-     *
+     * <p>
      * On macOS/Linux: returns null (no equivalent service yet).
      * On Windows: first invocation may trigger a location permission prompt.
-     *
+     * <p>
      * Return cases:
-     *   - {lat, lng}  : success
-     *   - null        : permission denied, location unavailable, timeout, or non-Windows
+     * - {lat, lng}  : success
+     * - null        : permission denied, location unavailable, timeout, or non-Windows
      */
-    private static double[] getPreciseCoordinates() {
-
-    if (!System.getProperty("os.name", "")
-            .toLowerCase()
-            .contains("win")) {
-        return null;
+    private record WindowsLocation(
+            double lat, double lon,
+            String city, String state, String country, String zip) {
     }
 
-    String psScript = """
-        Add-Type -AssemblyName System.Device
 
-        $GeoWatcher = New-Object System.Device.Location.GeoCoordinateWatcher
+    /**
+     * Runs Windows Location Services (GeoCoordinateWatcher) AND reverse-geocodes
+     * via Nominatim entirely inside PowerShell, returning one line:
+     * lat|lon|city|state|country|zip
+     * Geocode fields may be empty if Nominatim is unreachable -- Java's IP
+     * fallback fills those in while preserving the precise coords.
+     * <p>
+     * Returns null on non-Windows, permission denied, no fix, or timeout.
+     */
+    private static WindowsLocation getWindowsLocation() {
+        if (!System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            return null;
+        }
 
+        String psScript = """
+                $ProgressPreference = 'SilentlyContinue'
+                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                
+                Add-Type -AssemblyName System.Device
+                $watcher = New-Object System.Device.Location.GeoCoordinateWatcher
+                $watcher.Start() | Out-Null
+                
+                $loc = $null
+                $tries = 0
+                while ($tries -lt 40) {
+                    if ($watcher.Permission -eq 'Denied') {
+                        $watcher.Stop() | Out-Null
+                        Write-Output 'ACCESS_DENIED'
+                        return
+                    }
+                    $p = $watcher.Position.Location
+                    if (-not $p.IsUnknown) { $loc = $p; break }
+                    Start-Sleep -Milliseconds 500
+                    $tries = $tries + 1
+                }
+                $watcher.Stop() | Out-Null
+                
+                if ($loc -eq $null) {
+                    Write-Output 'LOCATION_NOT_AVAILABLE'
+                    return
+                }
+                
+                $ci  = [Globalization.CultureInfo]::InvariantCulture
+                $lat = $loc.Latitude.ToString($ci)
+                $lon = $loc.Longitude.ToString($ci)
+                
+                $city = ''; $state = ''; $country = ''; $zip = ''
+                try {
+                    $url = "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=$lat&lon=$lon&zoom=14&addressdetails=1"
+                    $resp = Invoke-RestMethod -Uri $url -TimeoutSec 8 -ErrorAction Stop -Headers @{ 'User-Agent' = 'ActivePulse/1.0 (contact: support@aress.com)' }
+                    $a = $resp.address
+                    if     ($a.city)         { $city = $a.city }
+                    elseif ($a.town)         { $city = $a.town }
+                    elseif ($a.village)      { $city = $a.village }
+                    elseif ($a.municipality) { $city = $a.municipality }
+                    elseif ($a.suburb)       { $city = $a.suburb }
+                    elseif ($a.county)       { $city = $a.county }
+                    $state = $a.state; $country = $a.country; $zip = $a.postcode
+                } catch { }
+                
+                Write-Output ('{0}|{1}|{2}|{3}|{4}|{5}' -f $lat, $lon, $city, $state, $country, $zip)
+                """;
+
+        // UTF-16LE Base64 so PowerShell runs the script verbatim -- no re-tokenization,
+        // so the '&' in the Nominatim URL survives (fixes AmpersandNotAllowed).
+        String encoded = Base64.getEncoder()
+                .encodeToString(psScript.getBytes(StandardCharsets.UTF_16LE));
+
+        Process process = null;
         try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-EncodedCommand", encoded);
+            pb.redirectErrorStream(true);
+            process = pb.start();
 
-            $GeoWatcher.Start()
-
-            $timeout = 30
-
-            while (
-                ($GeoWatcher.Status -ne 'Ready') `
-                -and ($GeoWatcher.Permission -ne 'Denied') `
-                -and ($timeout -gt 0)
-            ) {
-                Start-Sleep -Seconds 1
-                $timeout--
+            String output = null;
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (!line.isEmpty()) output = line;   // keep LAST non-empty line
+                }
             }
 
-            if ($GeoWatcher.Permission -eq 'Denied') {
-                Write-Output 'ACCESS_DENIED'
-                return
+            if (!process.waitFor(PS_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                log.warn("PowerShell location script timed out after {}s", PS_TIMEOUT_SEC);
+                return null;
             }
 
-            if ($GeoWatcher.Status -ne 'Ready') {
-                Write-Output 'LOCATION_NOT_AVAILABLE'
-                return
+            if (output == null) {
+                log.debug("PowerShell returned no output");
+                return null;
+            }
+            if ("ACCESS_DENIED".equals(output)) {
+                log.warn("Windows Location Service permission denied");
+                return null;
+            }
+            if ("LOCATION_NOT_AVAILABLE".equals(output)) {
+                log.warn("Windows Location Service location unavailable");
+                return null;
             }
 
-            $loc = $GeoWatcher.Position.Location
-
-            if ($loc.IsUnknown) {
-                Write-Output 'LOCATION_NOT_AVAILABLE'
-                return
+            // Expected: lat|lon|city|state|country|zip  (geocode fields may be empty)
+            String[] parts = output.split("\\|", -1);
+            if (parts.length < 2) {
+                log.warn("Unexpected PowerShell location output: '{}'", output);
+                return null;
             }
 
-            $accuracy = 0
+            double lat = Double.parseDouble(parts[0].trim());
+            double lon = Double.parseDouble(parts[1].trim());
+            String city = parts.length > 2 ? parts[2].trim() : "";
+            String state = parts.length > 3 ? parts[3].trim() : "";
+            String country = parts.length > 4 ? parts[4].trim() : "";
+            String zip = parts.length > 5 ? parts[5].trim() : "";
 
-            try {
-                $accuracy = $loc.HorizontalAccuracy
-            }
-            catch {
-                $accuracy = 0
-            }
+            log.info("Windows location -> {},{} ({}, {}, {})", lat, lon, city, state, country);
+            return new WindowsLocation(lat, lon, city, state, country, zip);
 
-            Write-Output (
-                $loc.Latitude.ToString() +
-                "," +
-                $loc.Longitude.ToString() +
-                "," +
-                $accuracy.ToString()
-            )
-
-        }
-        finally {
-            $GeoWatcher.Stop()
-        }
-        """;
-
-    Process process = null;
-
-    try {
-
-        ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy", "Bypass",
-                "-Command",
-                psScript
-        );
-
-        pb.redirectErrorStream(true);
-
-        process = pb.start();
-
-        BufferedReader reader =
-                new BufferedReader(
-                        new InputStreamReader(
-                                process.getInputStream(),
-                                StandardCharsets.UTF_8));
-
-        String line;
-        String output = null;
-
-        while ((line = reader.readLine()) != null) {
-
-            line = line.trim();
-
-            if (!line.isEmpty()) {
-                output = line;
-            }
-        }
-
-        if (!process.waitFor(35, TimeUnit.SECONDS)) {
-            process.destroyForcibly();
+        } catch (Exception ex) {
+            log.error("Failed to get Windows location: {}", ex.getMessage());
             return null;
-        }
-
-        if (output == null) {
-            return null;
-        }
-
-        if ("ACCESS_DENIED".equals(output)) {
-
-            log.warn(
-                    "Windows Location Service permission denied."
-            );
-
-            return null;
-        }
-
-        if ("LOCATION_NOT_AVAILABLE".equals(output)) {
-
-            log.warn(
-                    "Windows Location Service location unavailable."
-            );
-
-            return null;
-        }
-
-        String[] parts = output.split(",");
-
-        if (parts.length < 2) {
-            return null;
-        }
-
-        double latitude =
-                Double.parseDouble(parts[0].trim());
-
-        double longitude =
-                Double.parseDouble(parts[1].trim());
-
-        double accuracy = 0;
-
-        if (parts.length >= 3) {
-            accuracy =
-                    Double.parseDouble(parts[2].trim());
-        }
-
-        log.info(
-                "GPS Coordinates -> Lat={}, Lon={}, Accuracy={}m",
-                latitude,
-                longitude,
-                accuracy
-        );
-
-        return new double[]{
-                latitude,
-                longitude
-        };
-
-    }
-    catch (Exception ex) {
-
-        log.error(
-                "Failed to get precise coordinates",
-                ex
-        );
-
-        return null;
-    }
-    finally {
-
-        if (process != null && process.isAlive()) {
-            process.destroyForcibly();
+        } finally {
+            if (process != null && process.isAlive()) {
+                process.destroyForcibly();
+            }
         }
     }
-}
+
     // ─── HTTP helper ─────────────────────────────────────────────────
 
     /**
-     * Single HTTP GET helper used by both Nominatim and ip-api lookups.
+     * Single HTTP GET helper used by all external lookups.
      * Pass a userAgent (required by Nominatim) or null (for ip-api).
      */
     private static String httpGet(String urlString, String userAgent) {
@@ -753,10 +469,6 @@ private static boolean tryNominatimGeocode(double lat, double lon, Map<String, O
 
     // ─── Helpers ─────────────────────────────────────────────────────
 
-    private static String firstNonEmpty(String... values) {
-        for (String v : values) if (v != null && !v.isBlank()) return v;
-        return "";
-    }
 
     private static String buildAddress(String city, String region, String country) {
         return java.util.stream.Stream.of(city, region, country)
