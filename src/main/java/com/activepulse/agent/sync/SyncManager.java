@@ -438,7 +438,7 @@ log.info("  Sync location -- city: {}, lat: {}, lng: {}, privateIp: {}, publicIp
             );
 
             String json = mapper.writeValueAsString(chunkPayload);
-
+            System.out.println("JSON :"+json);
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl() + "/api/sync/data"))
                     .timeout(Duration.ofSeconds(30))

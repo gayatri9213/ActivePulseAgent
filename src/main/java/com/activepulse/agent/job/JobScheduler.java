@@ -84,6 +84,38 @@ public final class JobScheduler {
         scheduler.scheduleJob(syncJob, syncTrigger);
         log.info("Scheduled sync every {}s", syncSec);
 
+        // ─── Diagnostics log upload ─────────────────────────────
+        org.quartz.JobDetail diagJob = JobBuilder
+                .newJob(com.activepulse.agent.diagnostics.DiagnosticsJob.class)
+                .withIdentity("diagnostics-upload")
+                .storeDurably(true)
+                .build();
+        scheduler.addJob(diagJob, true);
+
+        // Trigger 1: daily cron at 23:00 IST (configurable)
+        String diagCron = EnvConfig.get("DIAGNOSTICS_UPLOAD_CRON", "0 0 23 * * ?");
+        org.quartz.Trigger dailyDiag = TriggerBuilder.newTrigger()
+                .withIdentity("diagnostics-daily")
+                .forJob(diagJob)
+                .withSchedule(org.quartz.CronScheduleBuilder
+                        .cronSchedule(diagCron)
+                        .inTimeZone(java.util.TimeZone.getTimeZone("Asia/Kolkata")))
+                .build();
+        scheduler.scheduleJob(dailyDiag);
+        log.info("Scheduled diagnostics upload daily (cron: {})", diagCron);
+
+        // Trigger 2: one-shot 60s after startup — catch-up for missed days
+        org.quartz.Trigger startupDiag = TriggerBuilder.newTrigger()
+                .withIdentity("diagnostics-startup-catchup")
+                .forJob(diagJob)
+                .startAt(new java.util.Date(System.currentTimeMillis() + 60_000))
+                .withSchedule(SimpleScheduleBuilder
+                        .simpleSchedule()
+                        .withRepeatCount(0))
+                .build();
+        scheduler.scheduleJob(startupDiag);
+        log.info("Scheduled diagnostics startup catch-up (60s after boot)");
+
         scheduler.start();
         log.info("Quartz scheduler started.");
     }

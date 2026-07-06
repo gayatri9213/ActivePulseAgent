@@ -3,16 +3,26 @@
 
     <!--
         Log directory resolved via 'activepulse.logs.dir' system property,
-        set by Main.java on JVM startup. Fallback: user.home/.activepulse/logs
+        set by Main.java on JVM startup.
+
+        FALLBACK CHAIN (if activepulse.logs.dir is not set):
+          1. Windows:  %LOCALAPPDATA%\ActivePulse\logs
+                       → C:\Users\<username>\AppData\Local\ActivePulse\logs
+          2. Fallback: <user.home>/AppData/Local/ActivePulse/logs
+
+        The LOCALAPPDATA env variable is set by Windows automatically for
+        every user session.
     -->
-    <property name="LOG_DIR" value="${activepulse.logs.dir:-${user.home}/.activepulse/logs}"/>
+    <property name="LOG_DIR"
+              value="${activepulse.logs.dir:-${LOCALAPPDATA:-${user.home}/AppData/Local}/ActivePulse/logs}"/>
+
     <property name="LOG_PATTERN"
               value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
 
     <!--
         Daily file appender — no fixed <file> tag, filename IS the dated pattern.
-        Today's logs go into agent.2026-04-20.log; at midnight the next write
-        creates agent.2026-04-21.log automatically.
+        Today's logs go into agent.2026-07-06.0.log; at midnight the next write
+        creates agent.2026-07-07.0.log automatically.
     -->
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <encoder>

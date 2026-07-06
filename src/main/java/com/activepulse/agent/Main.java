@@ -1,5 +1,5 @@
 package com.activepulse.agent;
-import com.activepulse.agent.WatchdogMode;
+
 import com.activepulse.agent.autostart.AutostartFactory;
 import com.activepulse.agent.autostart.AutostartManager;
 import com.activepulse.agent.db.DatabaseManager;
@@ -12,6 +12,7 @@ import com.activepulse.agent.util.EnvConfig;
 import com.activepulse.agent.util.OsType;
 import com.activepulse.agent.util.PathResolver;
 import com.activepulse.agent.util.UserFilter;
+import com.activepulse.agent.diagnostics.DiagnosticsUploader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,6 +84,19 @@ public final class Main {
             return;
         }
 
+        // ═══ NEW: set log directory BEFORE any logger is initialized ═══
+        try {
+            Path logsDir = PathResolver.logsDir();
+            Files.createDirectories(logsDir);
+            System.setProperty("activepulse.logs.dir", logsDir.toString());
+        } catch (Throwable ignored) {
+            // Never crash on log-dir setup — logback fallback will handle it
+        }
+
+        // 3. NOW safe to initialize loggers
+        Logger log = LoggerFactory.getLogger(Main.class);
+        log.info("ActivePulse v{} starting...", VERSION);
+
         // ═══════════════════════════════════════════════════════════════
         // STEP 2: Log directory must be set BEFORE any logger is used.
         // Logback reads ${activepulse.logs.dir} at init time.
@@ -144,6 +158,15 @@ public final class Main {
             JobScheduler scheduler = new JobScheduler();
             scheduler.start();
 
+            // Check if the previous session ended cleanly (Task Manager kill detection)
+            new Thread(() -> {
+                try {
+                    DiagnosticsUploader.getInstance().checkPreviousShutdown();
+                } catch (Throwable t) {
+                    log.debug("Startup shutdown-check failed: {}", t.getMessage());
+                }
+            }, "activepulse-shutdown-check").start();
+
             // Step 9: Park — install shutdown hook and wait
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 log.info("Shutdown signal received — cleaning up...");
@@ -184,6 +207,18 @@ public final class Main {
 
                 SHUTDOWN.countDown();
                 log.info("Agent stopped.");
+                try {
+                    DiagnosticsUploader.getInstance().uploadLogs();
+                } catch (Throwable t) {
+                    log.warn("Shutdown diagnostics upload failed: {}", t.getMessage());
+                }
+
+                try {
+                    Thread.sleep(300);   // let logback flush the "Agent stopped." marker
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+
             }, "activepulse-shutdown"));
 
             log.info("Agent running. Press Ctrl-C to stop (or SIGTERM).");

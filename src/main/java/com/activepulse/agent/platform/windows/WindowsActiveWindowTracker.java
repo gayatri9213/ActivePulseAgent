@@ -41,8 +41,9 @@ public final class WindowsActiveWindowTracker implements ActiveWindowTracker {
             User32.INSTANCE.GetWindowThreadProcessId(hwnd, pidRef);
             int pid = pidRef.getValue();
 
-            String processName = "unknown";
+            String processName = null;
             if (pid > 0) {
+                // Attempt 1: OpenProcess + GetModuleFileNameExW (needs read access)
                 HANDLE h = Kernel32.INSTANCE.OpenProcess(PROCESS_FLAGS, false, pid);
                 if (h != null) {
                     try {
@@ -55,6 +56,32 @@ public final class WindowsActiveWindowTracker implements ActiveWindowTracker {
                     } finally {
                         Kernel32.INSTANCE.CloseHandle(h);
                     }
+                }
+
+                // Attempt 2: QueryFullProcessImageName (needs only PROCESS_QUERY_LIMITED_INFORMATION)
+                // Works when OpenProcess with VM_READ was denied (protected processes)
+                if (processName == null) {
+                    HANDLE h2 = Kernel32.INSTANCE.OpenProcess(0x1000, false, pid); // QUERY_LIMITED_INFORMATION only
+                    if (h2 != null) {
+                        try {
+                            char[] path = new char[1024];
+                            IntByReference size = new IntByReference(path.length);
+                            if (Kernel32.INSTANCE.QueryFullProcessImageName(h2, 0, path, size)) {
+                                String full = new String(path, 0, size.getValue());
+                                processName = Paths.get(full).getFileName().toString();
+                            }
+                        } catch (Throwable t) {
+                            log.debug("QueryFullProcessImageName failed for pid {}: {}", pid, t.getMessage());
+                        } finally {
+                            Kernel32.INSTANCE.CloseHandle(h2);
+                        }
+                    }
+                }
+
+                // Attempt 3: log the failure with a helpful marker
+                if (processName == null) {
+                    log.debug("Could not resolve process name for pid={} title='{}' " +
+                            "(protected/elevated process — access denied)", pid, title);
                 }
             }
 

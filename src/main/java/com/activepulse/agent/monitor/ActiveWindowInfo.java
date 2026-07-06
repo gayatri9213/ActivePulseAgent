@@ -2,7 +2,7 @@ package com.activepulse.agent.monitor;
 
 public record ActiveWindowInfo(String processName, String title, String url) {
     public static ActiveWindowInfo unknown() {
-        return new ActiveWindowInfo("unknown", "", "");
+        return new ActiveWindowInfo(null, "", "");   // ← was "unknown"
     }
 
     public boolean isSame(ActiveWindowInfo other) {

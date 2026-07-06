@@ -19,7 +19,7 @@ env:
   APP_DESCRIPTION: "ActivePulse Background Agent"
   APP_COPYRIGHT: "Copyright (c) 2026 Aress Software"
   MAIN_CLASS: com.activepulse.agent.Main
-  JAVA_VERSION: '21'
+  JAVA_VERSION: '17'
   JAVA_DISTRIBUTION: 'temurin'
 
 jobs:
