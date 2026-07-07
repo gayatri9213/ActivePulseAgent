@@ -46,9 +46,8 @@ import java.util.concurrent.CountDownLatch;
  */
 public final class Main {
 
-    private static Logger log = null;
+    private static final Logger log = LoggerFactory.getLogger(Main.class);
     private static final CountDownLatch SHUTDOWN = new CountDownLatch(1);
-    private static final String VERSION = "1.0.0";
 
     public static void main(String[] args) {
 
@@ -95,8 +94,8 @@ public final class Main {
         }
 
         // 3. NOW safe to initialize loggers
-        Logger log = LoggerFactory.getLogger(Main.class);
-        log.info("ActivePulse v{} starting...",VERSION);
+
+        log.info("ActivePulse 1.0.0 starting...");
 
         // ═══════════════════════════════════════════════════════════════
         // STEP 2: Log directory must be set BEFORE any logger is used.
@@ -114,7 +113,7 @@ public final class Main {
         }
         System.setProperty("jnativehook.lib.path", nativeDir.toString());
 
-        log = LoggerFactory.getLogger(Main.class);
+
         log.info("╔═══════════════════════════════════════════════╗");
         log.info("║  ActivePulse Agent — {}", EnvConfig.get("AGENT_VERSION", "1.0.0"));
         log.info("║  OS:      {}", OsType.displayName());
@@ -156,7 +155,7 @@ public final class Main {
             }
 
             // Step 8: Scheduler
-            JobScheduler scheduler = new JobScheduler();
+            final JobScheduler scheduler = new JobScheduler();
             scheduler.start();
 
             // Check if the previous session ended cleanly (Task Manager kill detection)
