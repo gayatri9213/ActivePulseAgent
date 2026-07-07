@@ -48,6 +48,7 @@ public final class Main {
 
     private static Logger log = null;
     private static final CountDownLatch SHUTDOWN = new CountDownLatch(1);
+    private static final String VERSION = "1.0.0";
 
     public static void main(String[] args) {
 
@@ -95,7 +96,7 @@ public final class Main {
 
         // 3. NOW safe to initialize loggers
         Logger log = LoggerFactory.getLogger(Main.class);
-        log.info("ActivePulse v{} starting...", VERSION);
+        log.info("ActivePulse v{} starting...",VERSION);
 
         // ═══════════════════════════════════════════════════════════════
         // STEP 2: Log directory must be set BEFORE any logger is used.
