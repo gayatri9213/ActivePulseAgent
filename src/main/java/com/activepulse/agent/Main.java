@@ -3,6 +3,8 @@ package com.activepulse.agent;
 import com.activepulse.agent.autostart.AutostartFactory;
 import com.activepulse.agent.autostart.AutostartManager;
 import com.activepulse.agent.db.DatabaseManager;
+import com.activepulse.agent.diagnostics.DiagnosticsFallbackJob;
+import com.activepulse.agent.diagnostics.DiagnosticsUploader;
 import com.activepulse.agent.job.JobScheduler;
 import com.activepulse.agent.monitor.ActivitySessionManager;
 import com.activepulse.agent.monitor.AppConfigManager;
@@ -12,7 +14,12 @@ import com.activepulse.agent.util.EnvConfig;
 import com.activepulse.agent.util.OsType;
 import com.activepulse.agent.util.PathResolver;
 import com.activepulse.agent.util.UserFilter;
-import com.activepulse.agent.diagnostics.DiagnosticsUploader;
+import org.quartz.CronScheduleBuilder;
+import org.quartz.JobBuilder;
+import org.quartz.JobDetail;
+import org.quartz.Scheduler;
+import org.quartz.Trigger;
+import org.quartz.TriggerBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,6 +28,7 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
 
 /**
@@ -37,7 +45,9 @@ import java.util.concurrent.CountDownLatch;
  * 7. Register autostart (HKLM on Windows, LaunchAgent on macOS, .desktop on Linux)
  * 8. Start KeyboardMouseTracker (JNativeHook)
  * 9. Start JobScheduler (activity/strokes/screenshots/sync)
- * 10. Park main thread until shutdown signal
+ * 10. Schedule diagnostics 12 PM fallback via Quartz
+ * 11. Start diagnostics heartbeat + unclean-shutdown catch-up (async)
+ * 12. Park main thread until shutdown signal
  *
  * --no-watchdog flag: passed by WatchdogMode when spawning the child.
  * Tells this Main to skip the watchdog branch and run as the agent directly.
@@ -84,7 +94,7 @@ public final class Main {
             return;
         }
 
-        // ═══ NEW: set log directory BEFORE any logger is initialized ═══
+        // ═══ Set log directory BEFORE any logger is initialized ═══
         try {
             Path logsDir = PathResolver.logsDir();
             Files.createDirectories(logsDir);
@@ -93,8 +103,7 @@ public final class Main {
             // Never crash on log-dir setup — logback fallback will handle it
         }
 
-        // 3. NOW safe to initialize loggers
-
+        // NOW safe to initialize loggers
         log.info("ActivePulse 1.0.0 starting...");
 
         // ═══════════════════════════════════════════════════════════════
@@ -154,11 +163,29 @@ public final class Main {
                 KeyboardMouseTracker.getInstance().start();
             }
 
-            // Step 8: Scheduler
+            // Step 8: Scheduler (activity, strokes, screenshots, sync jobs)
             final JobScheduler scheduler = new JobScheduler();
             scheduler.start();
 
-            // Check if the previous session ended cleanly (Task Manager kill detection)
+            // ═══════════════════════════════════════════════════════════
+            // Step 9: Schedule diagnostics 12 PM fallback via Quartz.
+            // Fires uploadDailyFallback() every day at 12:00:00 IST.
+            // Skips if shutdown handler already synced today.
+            // ═══════════════════════════════════════════════════════════
+            try {
+                scheduleDiagnosticsFallback(scheduler);
+            } catch (Throwable t) {
+                log.warn("Failed to schedule diagnostics fallback: {}", t.getMessage());
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Step 10: Diagnostics heartbeat + unclean-shutdown catch-up.
+            // Async to keep boot fast. checkPreviousShutdown:
+            //   - Reads last-heartbeat.txt
+            //   - If stale (> 5 min old) → previous session died uncleanly
+            //     → calls uploadOnShutdown() as catch-up
+            //   - Then starts the heartbeat writer thread
+            // ═══════════════════════════════════════════════════════════
             new Thread(() -> {
                 try {
                     DiagnosticsUploader.getInstance().checkPreviousShutdown();
@@ -167,58 +194,52 @@ public final class Main {
                 }
             }, "activepulse-shutdown-check").start();
 
-            // Step 9: Park — install shutdown hook and wait
+            // Step 11: Park — install shutdown hook and wait
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                log.info("Shutdown signal received — cleaning up...");
                 try {
-                    scheduler.stop();
-                } catch (Throwable t) {
-                    log.warn("Scheduler stop failed: {}", t.getMessage());
-                }
+                    log.info("Agent shutdown hook fired — running last-mile tasks...");
 
-                try {
-                    KeyboardMouseTracker.getInstance().stop();
-                } catch (Throwable t) {
-                    log.warn("KM tracker stop failed: {}", t.getMessage());
-                }
+                    // 1. Flush any in-progress activity session so nothing is lost
+                    try {
+                        ActivitySessionManager.getInstance().flushCurrent();
+                    } catch (Throwable t) {
+                        log.warn("flushCurrent failed on shutdown: {}", t.getMessage());
+                    }
 
-                try {
-                    ActivitySessionManager.getInstance().flushCurrent();
-                } catch (Throwable t) {
-                    log.warn("Activity flush failed: {}", t.getMessage());
-                }
+                    // 2. Run one last sync (activity + screenshots)
+                    try {
+                        SyncManager.getInstance().syncBeforeShutdown();
+                    } catch (Throwable t) {
+                        log.warn("syncBeforeShutdown failed: {}", t.getMessage());
+                    }
 
-                try {
-                    SyncManager.getInstance().syncBeforeShutdown();
-                } catch (Throwable t) {
-                    log.warn("Final sync failed: {}", t.getMessage());
-                }
+                    // 3. Upload diagnostics logs (yesterday-if-unsynced + today partial)
+                    try {
+                        DiagnosticsUploader.getInstance().uploadOnShutdown();
+                    } catch (Throwable t) {
+                        log.warn("Diagnostics uploadOnShutdown failed: {}", t.getMessage());
+                    }
 
-                try {
-                    DatabaseManager.getInstance().shutdown();
-                } catch (Throwable t) {
-                    log.warn("DB close failed: {}", t.getMessage());
-                }
+                    // 4. Mark clean shutdown (deletes heartbeat file so next
+                    //    startup knows this exit was intentional).
+                    try {
+                        DiagnosticsUploader.getInstance().markCleanShutdown();
+                    } catch (Throwable t) {
+                        log.warn("markCleanShutdown failed: {}", t.getMessage());
+                    }
 
-                try {
-                    lock.release();
-                } catch (Throwable ignored) {
-                }
+                    // 5. Stop keyboard/mouse hook cleanly
+                    try {
+                        KeyboardMouseTracker.getInstance().stop();
+                    } catch (Throwable t) {
+                        log.warn("KeyboardMouseTracker.stop failed: {}", t.getMessage());
+                    }
 
-                SHUTDOWN.countDown();
-                log.info("Agent stopped.");
-                try {
-                    DiagnosticsUploader.getInstance().uploadLogs();
-                } catch (Throwable t) {
-                    log.warn("Shutdown diagnostics upload failed: {}", t.getMessage());
+                    log.info("Shutdown hook complete.");
+                } catch (Throwable outer) {
+                    // Never let the hook itself crash — that could hang shutdown
+                    log.error("Shutdown hook top-level error: {}", outer.getMessage());
                 }
-
-                try {
-                    Thread.sleep(300);   // let logback flush the "Agent stopped." marker
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
-
             }, "activepulse-shutdown"));
 
             log.info("Agent running. Press Ctrl-C to stop (or SIGTERM).");
@@ -230,6 +251,46 @@ public final class Main {
             log.error("Fatal error in agent main loop: {}", t.getMessage(), t);
             System.exit(1);
         }
+    }
+
+    /**
+     * Schedules the diagnostics fallback job with Quartz.
+     * Default: every day at 12:00:00 IST (Asia/Kolkata).
+     * Cron can be overridden via DIAGNOSTICS_UPLOAD_CRON in agent.env.
+     *
+     * Misfire policy: fireAndProceed — if the machine was off at 12 PM,
+     * the job fires ASAP when the scheduler wakes up.
+     *
+     * Requires JobScheduler to expose the underlying Quartz Scheduler
+     * via getQuartzScheduler(). If your JobScheduler doesn't have this
+     * getter, add:
+     *
+     *     public Scheduler getQuartzScheduler() { return this.scheduler; }
+     *
+     * where 'scheduler' is the internal Quartz field name.
+     */
+    private static void scheduleDiagnosticsFallback(JobScheduler jobScheduler) throws Exception {
+        Scheduler quartz = jobScheduler.getQuartzScheduler();
+        if (quartz == null) {
+            log.warn("Quartz scheduler unavailable — diagnostics fallback not scheduled");
+            return;
+        }
+
+        String cronExpr = EnvConfig.get("DIAGNOSTICS_UPLOAD_CRON", "0 0 12 * * ?");
+
+        JobDetail job = JobBuilder.newJob(DiagnosticsFallbackJob.class)
+                .withIdentity("diagnostics.fallback", "diagnostics")
+                .build();
+
+        Trigger trigger = TriggerBuilder.newTrigger()
+                .withIdentity("diagnostics.fallback.trigger", "diagnostics")
+                .withSchedule(CronScheduleBuilder.cronSchedule(cronExpr)
+                        .inTimeZone(TimeZone.getTimeZone("Asia/Kolkata"))
+                        .withMisfireHandlingInstructionFireAndProceed())
+                .build();
+
+        quartz.scheduleJob(job, trigger);
+        log.info("Scheduled diagnostics fallback job with cron: {} (Asia/Kolkata)", cronExpr);
     }
 
     /**

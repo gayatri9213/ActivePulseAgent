@@ -15,6 +15,16 @@ import static org.quartz.TriggerBuilder.newTrigger;
 /**
  * Central scheduler — starts Quartz and schedules all periodic jobs
  * using intervals from agent.env.
+ *
+ * Jobs scheduled here:
+ *   - ActivityJob            (window/URL capture every N sec)
+ *   - StrokeAggregationJob   (keyboard/mouse count aggregation)
+ *   - ScreenshotJob          (screenshot capture)
+ *   - SyncJob                (server sync)
+ *
+ * Diagnostics upload jobs are scheduled by Main.java after this
+ * scheduler starts. See Main.scheduleDiagnosticsFallback() —
+ * that path uses getQuartzScheduler() to reuse this Scheduler.
  */
 public final class JobScheduler {
 
@@ -84,40 +94,24 @@ public final class JobScheduler {
         scheduler.scheduleJob(syncJob, syncTrigger);
         log.info("Scheduled sync every {}s", syncSec);
 
-        // ─── Diagnostics log upload ─────────────────────────────
-        org.quartz.JobDetail diagJob = JobBuilder
-                .newJob(com.activepulse.agent.diagnostics.DiagnosticsJob.class)
-                .withIdentity("diagnostics-upload")
-                .storeDurably(true)
-                .build();
-        scheduler.addJob(diagJob, true);
-
-        // Trigger 1: daily cron at 23:00 IST (configurable)
-        String diagCron = EnvConfig.get("DIAGNOSTICS_UPLOAD_CRON", "0 0 23 * * ?");
-        org.quartz.Trigger dailyDiag = TriggerBuilder.newTrigger()
-                .withIdentity("diagnostics-daily")
-                .forJob(diagJob)
-                .withSchedule(org.quartz.CronScheduleBuilder
-                        .cronSchedule(diagCron)
-                        .inTimeZone(java.util.TimeZone.getTimeZone("Asia/Kolkata")))
-                .build();
-        scheduler.scheduleJob(dailyDiag);
-        log.info("Scheduled diagnostics upload daily (cron: {})", diagCron);
-
-        // Trigger 2: one-shot 60s after startup — catch-up for missed days
-        org.quartz.Trigger startupDiag = TriggerBuilder.newTrigger()
-                .withIdentity("diagnostics-startup-catchup")
-                .forJob(diagJob)
-                .startAt(new java.util.Date(System.currentTimeMillis() + 60_000))
-                .withSchedule(SimpleScheduleBuilder
-                        .simpleSchedule()
-                        .withRepeatCount(0))
-                .build();
-        scheduler.scheduleJob(startupDiag);
-        log.info("Scheduled diagnostics startup catch-up (60s after boot)");
+        // NOTE: Diagnostics upload is scheduled by Main.java after start() returns.
+        // The old DiagnosticsJob daily cron + startup catch-up has been removed —
+        // Main.java now registers DiagnosticsFallbackJob for the 12 PM daily
+        // fallback, and DiagnosticsUploader.checkPreviousShutdown() handles
+        // the startup catch-up via a background thread.
 
         scheduler.start();
         log.info("Quartz scheduler started.");
+    }
+
+    /**
+     * Returns the underlying Quartz Scheduler so callers can add extra jobs
+     * that share this instance (e.g. Main.scheduleDiagnosticsFallback()).
+     *
+     * Returns null if start() hasn't been called yet.
+     */
+    public Scheduler getQuartzScheduler() {
+        return scheduler;
     }
 
     public void stop() {

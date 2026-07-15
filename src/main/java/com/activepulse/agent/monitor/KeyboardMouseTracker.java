@@ -9,24 +9,38 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 
 /**
- * Global keyboard/mouse listener that maintains rolling counts until
- * StrokeAggregationJob reads & resets them (once per minute).
+ * Global keyboard/mouse listener.
+ *
+ * TWO PARALLEL COUNTERS:
+ *   1. keyboardCount / mouseCount   — drained every minute by StrokeAggregationJob
+ *   2. totalInputs                  — NEVER drained; monotonically increasing
+ *      Used by ActivitySessionManager to know if input happened during a
+ *      specific session window (snapshot at session start, compare at flush).
+ *
+ * Also tracks lastInputAtMs (never reset) for absolute idle-time queries.
  */
 public final class KeyboardMouseTracker
-        implements NativeKeyListener, NativeMouseListener, NativeMouseMotionListener, NativeMouseWheelListener {
+        implements NativeKeyListener, NativeMouseListener,
+        NativeMouseMotionListener, NativeMouseWheelListener {
 
     private static final Logger log = LoggerFactory.getLogger(KeyboardMouseTracker.class);
     private static final KeyboardMouseTracker INSTANCE = new KeyboardMouseTracker();
 
+    // Drainable counters — reset by StrokeAggregationJob every minute
     private final AtomicInteger keyboardCount = new AtomicInteger(0);
     private final AtomicInteger mouseCount    = new AtomicInteger(0);
 
+    // NEVER drained — used by ActivitySessionManager for per-session delta
+    private final AtomicLong totalInputs   = new AtomicLong(0);
+    private final AtomicLong lastInputAtMs = new AtomicLong(System.currentTimeMillis());
+
     private volatile boolean registered = false;
     private long lastMouseMoveMs = 0;
-    private static final long MOUSE_MOVE_DEBOUNCE_MS = 1000; // count at most 1 move/sec
+    private static final long MOUSE_MOVE_DEBOUNCE_MS = 1000;
 
     private KeyboardMouseTracker() {}
 
@@ -35,17 +49,13 @@ public final class KeyboardMouseTracker
     public synchronized void start() {
         if (registered) return;
         try {
-
-            // Tell JNativeHook to extract its native .dll/.so/.dylib to a
-            // per-user writable directory. Without this, per-machine installs
-            // (under C:\Program Files\...) fail with "Access is denied" because
-            // JNativeHook's default is to drop the DLL next to its JAR.
             java.nio.file.Path nativeDir = com.activepulse.agent.util.PathResolver
                     .dataDir().resolve("native");
             try { java.nio.file.Files.createDirectories(nativeDir); } catch (Exception ignored) {}
             System.setProperty("jnativehook.lib.path", nativeDir.toString());
-            // Silence JNativeHook's java.util.logging output
-            java.util.logging.Logger l = java.util.logging.Logger.getLogger(GlobalScreen.class.getPackage().getName());
+
+            java.util.logging.Logger l = java.util.logging.Logger.getLogger(
+                    GlobalScreen.class.getPackage().getName());
             l.setLevel(Level.WARNING);
             l.setUseParentHandlers(false);
 
@@ -55,6 +65,8 @@ public final class KeyboardMouseTracker
             GlobalScreen.addNativeMouseMotionListener(this);
             GlobalScreen.addNativeMouseWheelListener(this);
             registered = true;
+
+            lastInputAtMs.set(System.currentTimeMillis());
             log.info("Global keyboard/mouse hook registered.");
         } catch (NativeHookException e) {
             log.error("Failed to register native hook: {}", e.getMessage());
@@ -77,7 +89,8 @@ public final class KeyboardMouseTracker
     }
 
     /**
-     * Reads and zeroes both counters. Called by StrokeAggregationJob.
+     * Reads and zeroes the drainable counters. Called by StrokeAggregationJob.
+     * Does NOT reset totalInputs or lastInputAtMs.
      */
     public int[] drain() {
         int k = keyboardCount.getAndSet(0);
@@ -85,17 +98,41 @@ public final class KeyboardMouseTracker
         return new int[] { k, m };
     }
 
-    // ─── Listener callbacks ──────────────────────────────────────────
+    /** Epoch millis of the last real input event. Never drained. */
+    public long getLastInputAtMs() {
+        return lastInputAtMs.get();
+    }
+
+    /**
+     * Monotonically increasing count of ALL input events since agent start.
+     * Snapshot this at session start; compare at session end; delta tells you
+     * how many events happened during the session (irrespective of drain cycles).
+     */
+    public long getTotalInputs() {
+        return totalInputs.get();
+    }
+
+    public long secondsSinceLastInput() {
+        long now = System.currentTimeMillis();
+        long last = lastInputAtMs.get();
+        return Math.max(0, (now - last) / 1000);
+    }
+
+    // ─── Listener callbacks — every event updates BOTH totalInputs AND lastInputAtMs ─
 
     @Override
     public void nativeKeyPressed(NativeKeyEvent e) {
         keyboardCount.incrementAndGet();
+        totalInputs.incrementAndGet();
+        lastInputAtMs.set(System.currentTimeMillis());
         UserStatusTracker.getInstance().markActivity();
     }
 
     @Override
     public void nativeMousePressed(NativeMouseEvent e) {
         mouseCount.incrementAndGet();
+        totalInputs.incrementAndGet();
+        lastInputAtMs.set(System.currentTimeMillis());
         UserStatusTracker.getInstance().markActivity();
     }
 
@@ -104,14 +141,20 @@ public final class KeyboardMouseTracker
         long now = System.currentTimeMillis();
         if (now - lastMouseMoveMs > MOUSE_MOVE_DEBOUNCE_MS) {
             mouseCount.incrementAndGet();
+            totalInputs.incrementAndGet();   // debounced — max 1 per sec for mouse move
             lastMouseMoveMs = now;
         }
+        lastInputAtMs.set(now);
         UserStatusTracker.getInstance().markActivity();
     }
 
     @Override public void nativeMouseDragged(NativeMouseEvent e) { nativeMouseMoved(e); }
-    @Override public void nativeMouseWheelMoved(NativeMouseWheelEvent e) {
+
+    @Override
+    public void nativeMouseWheelMoved(NativeMouseWheelEvent e) {
         mouseCount.incrementAndGet();
+        totalInputs.incrementAndGet();
+        lastInputAtMs.set(System.currentTimeMillis());
         UserStatusTracker.getInstance().markActivity();
     }
 
