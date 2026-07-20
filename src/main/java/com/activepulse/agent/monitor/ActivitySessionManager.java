@@ -28,11 +28,17 @@ import java.util.Set;
  * IDENTIFIER LOGIC (stored as "app" column):
  *   1. YouTube session with URL          -> full URL
  *   2. YouTube session without URL       -> "youtube.com | <video title>" from title
- *   3. YouTube session, no useful title  -> process name
+ *   3. YouTube session, no useful title  -> process name (friendly)
  *   4. Other browser tab with URL        -> domain
  *   5. Known desktop app (map)           -> mapped domain
  *   6. Blank / unresolvable process      -> "System Process"
- *   7. Everything else                   -> process name
+ *   7. Everything else                   -> friendly process name (or raw exe if not mapped)
+ *
+ * FRIENDLY PROCESS NAMES:
+ *   safeProcessName() maps common Windows process exe names to human-friendly
+ *   display names before storing in DB. e.g. explorer.exe -> "File Explorer",
+ *   wps.exe -> "WPS Office", taskmgr.exe -> "Task Manager".
+ *   Unmapped processes keep their raw exe name.
  *
  * ACTIVITY TYPE RULES:
  *   R1: YouTube session with <= 5 input events for 1h+ -> IDLE
@@ -47,7 +53,7 @@ public final class ActivitySessionManager {
     private ActiveWindowInfo currentWindow;
     private LocalDateTime    sessionStart;
     private long             sessionStartLastInputMs;
-    private long             sessionStartTotalInputs;   // NEW: snapshot of KMT.getTotalInputs()
+    private long             sessionStartTotalInputs;
 
     private static final int  FAST_IDLE_THRESHOLD_SEC      = 300;
     private static final long YOUTUBE_IDLE_THRESHOLD_SEC   = 3600; //3600
@@ -115,6 +121,110 @@ public final class ActivitySessionManager {
             Map.entry("gmail",         "mail.google.com"),
             Map.entry("outlook",       "outlook.office.com")
     );
+
+    /**
+     * Friendly display names for common Windows processes.
+     * Used by safeProcessName() to convert raw exe names into human-readable
+     * labels before storing in DB.
+     *
+     * Extending: add a new Map.entry(...) line. Keys MUST be lowercase and
+     * include the .exe suffix.
+     */
+    private static final Map<String, String> PROCESS_DISPLAY_NAMES = Map.ofEntries(
+            // Windows system tools
+            Map.entry("explorer.exe",            "File Explorer"),
+            Map.entry("cmd.exe",                 "Command Prompt"),
+            Map.entry("powershell.exe",          "PowerShell"),
+            Map.entry("pwsh.exe",                "PowerShell 7"),
+            Map.entry("powershell_ise.exe",      "PowerShell ISE"),
+            Map.entry("wt.exe",                  "Windows Terminal"),
+            Map.entry("windowsterminal.exe",     "Windows Terminal"),
+            Map.entry("taskmgr.exe",             "Task Manager"),
+            Map.entry("notepad.exe",             "Notepad"),
+            Map.entry("mspaint.exe",             "Paint"),
+            Map.entry("calc.exe",                "Calculator"),
+            Map.entry("snippingtool.exe",        "Snipping Tool"),
+            Map.entry("screensketch.exe",        "Snip and Sketch"),
+            Map.entry("lockapp.exe",             "Windows Lock Screen"),
+            Map.entry("logonui.exe",             "Windows Login Screen"),
+            Map.entry("searchapp.exe",           "Windows Search"),
+            Map.entry("searchhost.exe",          "Windows Search"),
+            Map.entry("shellexperiencehost.exe", "Windows Shell"),
+            Map.entry("runtimebroker.exe",       "Windows Runtime Broker"),
+            Map.entry("systemsettings.exe",      "Windows Settings"),
+            Map.entry("dwm.exe",                 "Windows Desktop Manager"),
+            Map.entry("applicationframehost.exe","Windows App Framework"),
+            // Microsoft Office
+            Map.entry("winword.exe",             "Microsoft Word"),
+            Map.entry("excel.exe",               "Microsoft Excel"),
+            Map.entry("powerpnt.exe",            "Microsoft PowerPoint"),
+            Map.entry("outlook.exe",             "Microsoft Outlook"),
+            Map.entry("onenote.exe",             "Microsoft OneNote"),
+            Map.entry("msaccess.exe",            "Microsoft Access"),
+            Map.entry("teams.exe",               "Microsoft Teams"),
+            Map.entry("ms-teams.exe",            "Microsoft Teams"),
+            Map.entry("onedrive.exe",            "OneDrive"),
+            // WPS Office
+            Map.entry("wps.exe",                 "WPS Office"),
+            Map.entry("wpsoffice.exe",           "WPS Office"),
+            Map.entry("et.exe",                  "WPS Spreadsheets"),
+            Map.entry("wpp.exe",                 "WPS Presentation"),
+            Map.entry("wpspdf.exe",              "WPS PDF Reader"),
+            Map.entry("ksolaunch.exe",           "WPS Office Launcher"),
+            // Browsers (shown only when URL is unavailable, e.g. chrome://newtab)
+            Map.entry("chrome.exe",              "Google Chrome"),
+            Map.entry("msedge.exe",              "Microsoft Edge"),
+            Map.entry("firefox.exe",             "Mozilla Firefox"),
+            Map.entry("brave.exe",               "Brave"),
+            Map.entry("opera.exe",               "Opera"),
+            Map.entry("opera_gx.exe",            "Opera GX"),
+            Map.entry("vivaldi.exe",             "Vivaldi"),
+            Map.entry("arc.exe",                 "Arc"),
+            Map.entry("iexplore.exe",            "Internet Explorer"),
+            // Developer tools
+            Map.entry("code.exe",                "Visual Studio Code"),
+            Map.entry("devenv.exe",              "Visual Studio"),
+            Map.entry("idea64.exe",              "IntelliJ IDEA"),
+            Map.entry("studio64.exe",            "Android Studio"),
+            Map.entry("pycharm64.exe",           "PyCharm"),
+            Map.entry("webstorm64.exe",          "WebStorm"),
+            Map.entry("notepad++.exe",           "Notepad++"),
+            Map.entry("sublime_text.exe",        "Sublime Text"),
+            // Communication apps
+            Map.entry("slack.exe",               "Slack"),
+            Map.entry("discord.exe",             "Discord"),
+            Map.entry("skype.exe",               "Skype"),
+            Map.entry("zoom.exe",                "Zoom"),
+            Map.entry("whatsapp.exe",            "WhatsApp"),
+            // Media / Utilities
+            Map.entry("vlc.exe",                 "VLC Media Player"),
+            Map.entry("wmplayer.exe",            "Windows Media Player"),
+            Map.entry("lightshot.exe",           "Lightshot"),
+            Map.entry("7zfm.exe",                "7-Zip"),
+            Map.entry("winrar.exe",              "WinRAR")
+    );
+
+    /**
+     * Friendly names for Windows registered class names. Used when the process
+     * name resolves through GetClassName fallback (prefixed "class:" by
+     * WindowsActiveWindowTracker.tryClassName). These are the class names
+     * you'll see for UWP apps, Windows shell parts, desktop, taskbar, etc.
+     */
+    private static final Map<String, String> WINDOW_CLASS_DISPLAY_NAMES = Map.ofEntries(
+            Map.entry("progman",                                        "Windows Desktop"),
+            Map.entry("workerw",                                        "Windows Desktop"),
+            Map.entry("shell_traywnd",                                  "Taskbar"),
+            Map.entry("shell_secondarytraywnd",                         "Taskbar"),
+            Map.entry("notifyiconoverflowwindow",                       "Taskbar Overflow"),
+            Map.entry("applicationframewindow",                         "Windows App Frame"),
+            Map.entry("windows.ui.core.corewindow",                     "Windows UWP App"),
+            Map.entry("windows.ui.input.inputsite.windowclass",         "Windows Input Host"),
+            Map.entry("multitaskingviewframe",                          "Task View"),
+            Map.entry("xamlwindow",                                     "Windows XAML App"),
+            Map.entry("touchkeyboardwindow",                            "Touch Keyboard"),
+            Map.entry("cicerouiwndframe",                               "Text Input Manager")
+    );
+
 
     // ═════════════════════════════════════════════════════════════════
     // Helpers
@@ -211,6 +321,12 @@ public final class ActivitySessionManager {
         return null;
     }
 
+    /**
+     * Normalize the raw process name to a display-ready label:
+     *   1. null / blank / "unknown" / "n/a" -> "System Process"
+     *   2. Known exe with a friendly mapping -> friendly name from PROCESS_DISPLAY_NAMES
+     *   3. Everything else -> raw trimmed value
+     */
     private static String safeProcessName(String raw) {
         if (raw == null) return UNKNOWN_PROCESS_LABEL;
         String trimmed = raw.trim();
@@ -221,6 +337,19 @@ public final class ActivitySessionManager {
                 || lower.equals("n/a")   || lower.equals("null")) {
             return UNKNOWN_PROCESS_LABEL;
         }
+        // Friendly display-name lookup for known exe names
+        String friendly = PROCESS_DISPLAY_NAMES.get(lower);
+        if (friendly != null) return friendly;
+
+        // Window-class fallback (raw form is "class:Progman", etc.)
+        if (lower.startsWith("class:")) {
+            String cls = lower.substring("class:".length());
+            String mapped = WINDOW_CLASS_DISPLAY_NAMES.get(cls);
+            if (mapped != null) return mapped;
+            // Unknown class — keep the raw class name but drop the prefix for cleaner display
+            return trimmed.substring("class:".length());
+        }
+
         return trimmed;
     }
 
@@ -336,14 +465,6 @@ public final class ActivitySessionManager {
             }
 
             // R2: Browser open threshold+ with no URL AND low input rate -> AWAY
-            //
-            // We check inputsPerSec instead of UserStatusTracker's status because:
-            //   - The old check (!"ACTIVE".equals) required UserStatusTracker to
-            //     already report IDLE/AWAY, which needs a longer idle timeout than
-            //     R2 itself. That double-gate made R2 skip legit cases.
-            //   - The rate check is the same one R1 uses (INPUT_RATE_IDLE_THRESHOLD).
-            //     Low rate + empty URL + long session = user isn't productively
-            //     browsing, mark AWAY.
             if (isBrowser
                     && seconds >= BROWSER_NO_URL_THRESHOLD_SEC
                     && url.isEmpty()

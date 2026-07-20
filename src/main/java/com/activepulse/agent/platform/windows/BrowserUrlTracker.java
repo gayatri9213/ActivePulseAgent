@@ -22,22 +22,28 @@ import java.util.concurrent.TimeUnit;
  * Strategy:
  *   1. Traditional browsers (chrome.exe, msedge.exe, etc.) have a visible
  *      address bar element (name = "Address and search bar" on Chrome/Edge).
- *      → Strategy 1 in the PowerShell script.
+ *      -> Strategy 1 in the PowerShell script.
  *
  *   2. Firefox has a differently-named Edit control.
- *      → Strategy 2.
+ *      -> Strategy 2.
  *
  *   3. Some builds return the URL through an unnamed Edit control that just
  *      happens to hold an http* value (fallback).
- *      → Strategy 3.
+ *      -> Strategy 3.
  *
  *   4. PWA apps (youtube.exe, youtubemusic.exe) hide the address bar entirely.
  *      But Chromium still exposes the current URL via the Document element's
  *      ValuePattern. Reading that gives us the URL.
- *      → Strategy 4.
+ *      -> Strategy 4.
  *
- * Adding another PWA app later: just add its process name (lowercase) to
- * PWA_CAPABLE and it will use Strategy 4 automatically.
+ * BUG-FIX HISTORY:
+ *   The embedded PowerShell script used $pid as the out-parameter name for
+ *   GetWindowThreadProcessId. $pid is a READ-ONLY PowerShell automatic
+ *   variable that holds the current PowerShell process's own PID. Because
+ *   $ErrorActionPreference = SilentlyContinue was set at the top of the
+ *   script, the failed assignment was swallowed and the script silently
+ *   compared "powershell.exe" against the browser process name, always
+ *   mismatching, and returned empty. Renamed to $targetPid.
  *
  * Performance:
  *   The PowerShell invocation costs ~200-500ms. To avoid running it on every
@@ -61,11 +67,8 @@ public final class BrowserUrlTracker {
     /**
      * PWA / Chromium-embedded desktop apps whose address bar is hidden but
      * whose Document element still exposes the URL. Strategy 4 handles these.
-     * Add other apps here as needed (spotify.exe, discord.exe, teams.exe,
-     * ms-teams.exe, whatsapp.exe, notion.exe, slack.exe, figma.exe, etc.).
      */
     private static final Set<String> PWA_CAPABLE = Set.of(
-            "youtube.com",
             "youtube.exe",                    // Chrome/Edge YouTube PWA
             "youtubemusic.exe",                // Chrome/Edge YouTube Music PWA
             "ytdesktop.exe",                   // YouTube Desktop (3rd-party)
@@ -94,7 +97,7 @@ public final class BrowserUrlTracker {
 
     // --- Cache -------------------------------------------------------
 
-    private static final long CACHE_TTL_MS = 2_000;  // 2 sec
+    private static final long CACHE_TTL_MS = 2_000;
     private volatile String  cachedProcess;
     private volatile String  cachedTitle;
     private volatile String  cachedUrl;
@@ -122,33 +125,17 @@ public final class BrowserUrlTracker {
 
     // --- Public API --------------------------------------------------
 
-    /**
-     * Returns true if URL extraction is worth attempting for this process.
-     * Both traditional browsers and PWA-capable apps qualify.
-     *
-     * Static so callers can invoke it without asking for the singleton
-     * (matches existing WindowsActiveWindowTracker usage).
-     */
     public static boolean isBrowser(String processName) {
         if (processName == null || processName.isBlank()) return false;
         String lower = processName.trim().toLowerCase();
         return SUPPORTED_BROWSERS.contains(lower) || PWA_CAPABLE.contains(lower);
     }
 
-    /**
-     * Extract the URL from the currently focused window of the given process.
-     * Returns empty string if extraction fails (never null).
-     *
-     * @param processName  e.g. "chrome.exe" or "youtube.exe"
-     * @param windowTitle  used as part of the cache key so navigation
-     *                     invalidates cached value automatically
-     */
     public String getUrl(String processName, String windowTitle) {
         if (!isBrowser(processName)) return "";
         String proc = processName.trim().toLowerCase();
         String title = windowTitle == null ? "" : windowTitle;
 
-        // Cache hit?
         long now = System.currentTimeMillis();
         if (cachedProcess != null
                 && cachedProcess.equals(proc)
@@ -158,7 +145,6 @@ public final class BrowserUrlTracker {
             return cachedUrl == null ? "" : cachedUrl;
         }
 
-        // Ensure script is on disk
         try {
             ensureScriptWritten();
         } catch (IOException e) {
@@ -166,10 +152,8 @@ public final class BrowserUrlTracker {
             return "";
         }
 
-        // Run PowerShell and capture URL
         String url = runScript(proc);
 
-        // Cache result (even if empty)
         cachedProcess = proc;
         cachedTitle   = title;
         cachedUrl     = url;
@@ -182,17 +166,12 @@ public final class BrowserUrlTracker {
         return url == null ? "" : url;
     }
 
-    /** Convenience: no title. */
     public String getUrl(String processName) {
         return getUrl(processName, "");
     }
 
     // --- API expected by WindowsActiveWindowTracker ------------------
 
-    /**
-     * Immutable holder for the extracted URL. Uses a record-style accessor
-     * (url()) to match the caller in WindowsActiveWindowTracker.
-     */
     public static final class UrlResult {
         private final String url;
 
@@ -200,22 +179,13 @@ public final class BrowserUrlTracker {
             this.url = url == null ? "" : url;
         }
 
-        /** The extracted URL, or empty string if extraction failed. Never null. */
         public String url() { return url; }
 
-        /** Convenience: true if a real URL was extracted. */
         public boolean hasUrl() { return !url.isEmpty(); }
 
         @Override public String toString() { return "UrlResult[url=" + url + "]"; }
     }
 
-    /**
-     * Extract the URL for the currently focused window of the given process,
-     * wrapped in a UrlResult. Returns a non-null UrlResult even on failure
-     * (result.url() will be empty).
-     *
-     * This is the API the existing WindowsActiveWindowTracker uses.
-     */
     public UrlResult getActiveUrl(String processName) {
         String url = getUrl(processName, "");
         return new UrlResult(url);
@@ -267,8 +237,6 @@ public final class BrowserUrlTracker {
             }
 
             String result = out.toString().trim();
-            // Script prints exactly one line: the URL, or empty string.
-            // If it printed error text, ignore.
             if (result.startsWith("http://") || result.startsWith("https://")) {
                 return result;
             }
@@ -285,6 +253,12 @@ public final class BrowserUrlTracker {
     //
     // 4-strategy URL extraction. ASCII only. No backtick line-continuations.
     // Prints EXACTLY one line to stdout: the URL, or blank.
+    //
+    // IMPORTANT: variable naming — do NOT use $pid, $host, $home, $args,
+    // $input, $matches, $psversiontable, or any other PowerShell automatic
+    // variable. These are read-only and assignments silently fail under
+    // SilentlyContinue, leading to hard-to-diagnose logic bugs.
+    // For the target-process PID, we use $targetPid.
 
     private static final String PS_SCRIPT = String.join("\n",
             "param(",
@@ -299,13 +273,11 @@ public final class BrowserUrlTracker {
             "    Add-Type -AssemblyName UIAutomationTypes",
             "} catch { Write-Output ''; exit 0 }",
             "",
-            "# Find foreground window whose process matches",
             "$AT  = [System.Windows.Automation.AutomationElement]",
             "$TS  = [System.Windows.Automation.TreeScope]",
             "$CTP = [System.Windows.Automation.ControlType]",
             "$VP  = [System.Windows.Automation.ValuePattern]",
             "",
-            "# Get process id of foreground window via P/Invoke",
             "$sig = @'",
             "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow();",
             "[DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);",
@@ -313,17 +285,17 @@ public final class BrowserUrlTracker {
             "try { Add-Type -Name Win32Fg -Namespace ApWin -MemberDefinition $sig } catch { }",
             "",
             "$hwnd = [ApWin.Win32Fg]::GetForegroundWindow()",
-            "$pid = 0",
-            "[void][ApWin.Win32Fg]::GetWindowThreadProcessId($hwnd, [ref]$pid)",
             "",
-            "if ($pid -eq 0) { Write-Output ''; exit 0 }",
+            "# Do NOT rename this back to $pid - $pid is a read-only PowerShell automatic variable.",
+            "$targetPid = 0",
+            "[void][ApWin.Win32Fg]::GetWindowThreadProcessId($hwnd, [ref]$targetPid)",
             "",
-            "# Confirm the process name matches (defensive; caller passes it too)",
+            "if ($targetPid -eq 0) { Write-Output ''; exit 0 }",
+            "",
             "try {",
-            "    $procObj = Get-Process -Id $pid -ErrorAction Stop",
+            "    $procObj = Get-Process -Id $targetPid -ErrorAction Stop",
             "    $procExe = ($procObj.ProcessName + '.exe').ToLower()",
             "    if ($procExe -ne $ProcessName.ToLower()) {",
-            "        # foreground window is not the process we were asked about",
             "        Write-Output ''; exit 0",
             "    }",
             "} catch { Write-Output ''; exit 0 }",
@@ -409,7 +381,6 @@ public final class BrowserUrlTracker {
             "                $url = $v",
             "                break",
             "            }",
-            "            # Some PWAs expose URL as document Name",
             "            try {",
             "                $dn = $d.Current.Name",
             "                if ($dn -and $dn -match '^https?://') { $url = $dn; break }",
