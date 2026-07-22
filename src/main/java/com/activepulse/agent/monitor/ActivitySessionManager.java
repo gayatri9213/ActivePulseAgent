@@ -78,7 +78,7 @@ public final class ActivitySessionManager {
     private static final double INPUT_RATE_IDLE_THRESHOLD = 0.05;
 
     /** Fallback identifier when the Windows API returns no process name. */
-    private static final String UNKNOWN_PROCESS_LABEL = "System Process";
+    private static final String UNKNOWN_PROCESS_LABEL = "Unresolved Process";
 
     private static final Set<String> BROWSER_PROCESSES = Set.of(
             "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
@@ -222,8 +222,10 @@ public final class ActivitySessionManager {
             Map.entry("multitaskingviewframe",                          "Task View"),
             Map.entry("xamlwindow",                                     "Windows XAML App"),
             Map.entry("touchkeyboardwindow",                            "Touch Keyboard"),
-            Map.entry("cicerouiwndframe",                               "Text Input Manager")
+            Map.entry("cicerouiwndframe",                               "Text Input Manager"),
+            Map.entry("securedesktop",                                  "Windows Secure/Lock Screen")
     );
+
 
 
     // ═════════════════════════════════════════════════════════════════
@@ -335,6 +337,8 @@ public final class ActivitySessionManager {
         if (lower.equals("unknown") || lower.equals("unknown app")
                 || lower.equals("other") || lower.equals("(other)")
                 || lower.equals("n/a")   || lower.equals("null")) {
+            log.warn("Legacy 'unknown' string reached safeProcessName: '{}' - "
+                    + "find the source and fix at origin", raw);
             return UNKNOWN_PROCESS_LABEL;
         }
         // Friendly display-name lookup for known exe names
@@ -415,7 +419,8 @@ public final class ActivitySessionManager {
 
         String safeProc = safeProcessName(rawProc);
 
-        boolean isLockApp = proc.equals("lockapp.exe") || proc.equals("logonui.exe");
+        boolean isLockApp = proc.equals("lockapp.exe") || proc.equals("logonui.exe")
+                || proc.equals("class:securedesktop");
         boolean isBrowser = BROWSER_PROCESSES.contains(proc);
 
         // ─── Compute idle metrics ────────────────────────────────────
@@ -514,12 +519,10 @@ public final class ActivitySessionManager {
                 appIdentifier, safeTitle(rawTitle), url,
                 seconds, activityType);
 
-        log.info("Flushed activity: identifier={} (proc={}, url={}, title={}) "
-                        + "[{}->{}] {}s {} inputs={} rate={}/sec secSinceInput={}",
-                appIdentifier, safeProc, url, title,
-                fmt(start), fmt(end), seconds, activityType,
-                inputsDuringSession, String.format("%.4f", inputsPerSec),
-                secondsSinceLastInput);
+//        log.info("Flushed activity: identifier={} (proc={}, url={}, title={}) "
+//                        + "[{}->{}] {}s {}",
+//                appIdentifier, safeProc, url, title,
+//                fmt(start), fmt(end), seconds, activityType);
     }
 
     private static String safeTitle(String raw) {

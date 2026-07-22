@@ -36,14 +36,14 @@ public final class AppConfigManager {
             this.userSource    = "system-property";
         }
 
-        log.info("╔═══ AppConfig resolved ═══");
-        log.info("║  os           = {}", os);
-        log.info("║  domain       = '{}'", domain);
-        log.info("║  usernameShort= '{}'", usernameShort);
-        log.info("║  username     = '{}'  ← this is what gets stored", username);
-        log.info("║  userSource   = {}", userSource);
-        log.info("║  deviceId     = {}", deviceId);
-        log.info("╚══════════════════════════");
+        log.info("|------- AppConfig resolved -------|");
+        log.info("|  os           = {}", os);
+        log.info("|  domain       = '{}'", domain);
+        log.info("|  usernameShort= '{}'", usernameShort);
+        log.info("|  username     = '{}'", username);
+        log.info("|  userSource   = {}", userSource);
+        log.info("|  deviceId     = {}", deviceId);
+        log.info("|----------------------------------|");
     }
 
     public static AppConfigManager getInstance() {
@@ -57,6 +57,7 @@ public final class AppConfigManager {
 
     /** Full qualified: DOMAIN\\user — this is what DAOs and SyncManager use. */
     public String getUsername() { return username; }
+
 
     /** Just the username part, no domain. */
     public String getUsernameShort() { return usernameShort; }

@@ -60,7 +60,9 @@ public final class Main {
     private static final CountDownLatch SHUTDOWN = new CountDownLatch(1);
 
     public static void main(String[] args) {
-
+        System.setProperty("activepulse.logs.dir", resolveLogsDirEarly().toString());
+        System.out.println("LOGDIR PROP AT ENTRY = " + System.getProperty("activepulse.logs.dir"));
+        System.out.println("AGENT MODE = " + com.activepulse.agent.util.AgentMode.isTest());
         // ═══════════════════════════════════════════════════════════════
         // STEP 0: SKIP-USER GUARD — must run BEFORE any I/O.
         // If the current user is admin/system, exit silently. No folders,
@@ -94,24 +96,36 @@ public final class Main {
             return;
         }
 
-        // ═══ Set log directory BEFORE any logger is initialized ═══
-        try {
-            Path logsDir = PathResolver.logsDir();
-            Files.createDirectories(logsDir);
-            System.setProperty("activepulse.logs.dir", logsDir.toString());
-        } catch (Throwable ignored) {
-            // Never crash on log-dir setup — logback fallback will handle it
-        }
-
-        // NOW safe to initialize loggers
-        log.info("ActivePulse 1.0.0 starting...");
-
         // ═══════════════════════════════════════════════════════════════
-        // STEP 2: Log directory must be set BEFORE any logger is used.
-        // Logback reads ${activepulse.logs.dir} at init time.
+        // Set log directory BEFORE any logger is initialized.
+        // Use resolveLogsDirEarly() — it is mode-aware AND does not touch
+        // EnvConfig/SLF4J, so it won't lock Logback to the wrong path.
+        // Must run before the first log call below.
         // ═══════════════════════════════════════════════════════════════
         Path logsDir = resolveLogsDirEarly();
         System.setProperty("activepulse.logs.dir", logsDir.toString());
+
+        // NOW safe to initialize loggers
+        log.info("ActivePulse 1.0.0 starting...");
+//
+//        // ═══ Set log directory BEFORE any logger is initialized ═══
+//        try {
+//            Path logsDir = PathResolver.logsDir();
+//            Files.createDirectories(logsDir);
+//            System.setProperty("activepulse.logs.dir", logsDir.toString());
+//        } catch (Throwable ignored) {
+//            // Never crash on log-dir setup — logback fallback will handle it
+//        }
+//
+//        // NOW safe to initialize loggers
+//        log.info("ActivePulse 1.0.0 starting...");
+//
+//        // ═══════════════════════════════════════════════════════════════
+//        // STEP 2: Log directory must be set BEFORE any logger is used.
+//        // Logback reads ${activepulse.logs.dir} at init time.
+//        // ═══════════════════════════════════════════════════════════════
+//        Path logsDir = resolveLogsDirEarly();
+//        System.setProperty("activepulse.logs.dir", logsDir.toString());
 
         // Step 2b — Redirect JNativeHook's native lib extraction to a writable
         // per-user directory. Must be set before GlobalScreen is loaded.
@@ -123,14 +137,14 @@ public final class Main {
         System.setProperty("jnativehook.lib.path", nativeDir.toString());
 
 
-        log.info("╔═══════════════════════════════════════════════╗");
-        log.info("║  ActivePulse Agent — {}", EnvConfig.get("AGENT_VERSION", "1.0.0"));
-        log.info("║  OS:      {}", OsType.displayName());
-        log.info("║  Java:    {}", System.getProperty("java.version"));
-        log.info("║  User:    {}", System.getProperty("user.name"));
-        log.info("║  LogsDir: {}", logsDir);
-        log.info("║  DataDir: {}", PathResolver.dataDir());
-        log.info("╚═══════════════════════════════════════════════╝");
+        log.info("|------------------------------------------------|");
+        log.info("|  ActivePulse Agent — {}", EnvConfig.get("AGENT_VERSION", "1.0.0"));
+        log.info("|  OS:      {}", OsType.displayName());
+        log.info("|  Java:    {}", System.getProperty("java.version"));
+        log.info("|  User:    {}", System.getProperty("user.name"));
+        log.info("|  LogsDir: {}", logsDir);
+        log.info("|  DataDir: {}", PathResolver.dataDir());
+        log.info("|------------------------------------------------|");
 
         // Step 3: Single instance
         SingleInstanceLock lock = new SingleInstanceLock();
@@ -298,23 +312,60 @@ public final class Main {
      * Duplicates a bit of PathResolver logic on purpose — PathResolver calls
      * EnvConfig which initializes SLF4J, which locks Logback to the wrong path.
      */
+//    private static Path resolveLogsDirEarly() {
+//        String home = System.getProperty("user.home");
+//        String os = System.getProperty("os.name", "").toLowerCase();
+//        Path base;
+//
+//        if (os.contains("win")) {
+//            String localAppData = System.getenv("LOCALAPPDATA");
+//            base = (localAppData != null && !localAppData.isBlank())
+//                    ? Paths.get(localAppData, "ActivePulse")
+//                    : Paths.get(home, "AppData", "Local", "ActivePulse");
+//        } else if (os.contains("mac")) {
+//            base = Paths.get(home, "Library", "Application Support", "ActivePulse");
+//        } else {
+//            String xdg = System.getenv("XDG_DATA_HOME");
+//            base = (xdg != null && !xdg.isBlank())
+//                    ? Paths.get(xdg, "activepulse")
+//                    : Paths.get(home, ".local", "share", "activepulse");
+//        }
+//
+//        Path logs = base.resolve("logs");
+//        try {
+//            Files.createDirectories(logs);
+//        } catch (IOException e) {
+//            // Fallback: temp dir. Don't use System.err — not guaranteed visible on Windows.
+//            logs = Paths.get(System.getProperty("java.io.tmpdir"), "activepulse-logs");
+//            try {
+//                Files.createDirectories(logs);
+//            } catch (Exception ignored) {
+//            }
+//        }
+//        return logs;
+//    }
+
     private static Path resolveLogsDirEarly() {
         String home = System.getProperty("user.home");
         String os = System.getProperty("os.name", "").toLowerCase();
+        String folder = com.activepulse.agent.util.AgentMode.isTest()
+                ? "ActivePulse-Test" : "ActivePulse";
+        String linuxFolder = com.activepulse.agent.util.AgentMode.isTest()
+                ? "activepulse-test" : "activepulse";
         Path base;
 
         if (os.contains("win")) {
             String localAppData = System.getenv("LOCALAPPDATA");
             base = (localAppData != null && !localAppData.isBlank())
-                    ? Paths.get(localAppData, "ActivePulse")
-                    : Paths.get(home, "AppData", "Local", "ActivePulse");
+                    ? Paths.get(localAppData, folder)
+                    : Paths.get(home, "AppData", "Local", folder);
         } else if (os.contains("mac")) {
-            base = Paths.get(home, "Library", "Application Support", "ActivePulse");
+            base = Paths.get(home, "Library", "Application Support", folder);
         } else {
             String xdg = System.getenv("XDG_DATA_HOME");
             base = (xdg != null && !xdg.isBlank())
-                    ? Paths.get(xdg, "activepulse")
-                    : Paths.get(home, ".local", "share", "activepulse");
+                    ? Paths.get(xdg, linuxFolder)
+                    : Paths.get(home, ".local", "share", linuxFolder);
         }
 
         Path logs = base.resolve("logs");
@@ -330,6 +381,7 @@ public final class Main {
         }
         return logs;
     }
+
 
     /**
      * Force Logback to re-read its configuration now that activepulse.logs.dir is set.

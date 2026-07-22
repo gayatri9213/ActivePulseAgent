@@ -49,7 +49,7 @@ public final class EnvConfig {
             try (InputStream in = EnvConfig.class.getResourceAsStream("/agent.env.template")) {
                 if (in != null) {
                     props.load(in);
-                    log.info("Loaded default config from bundled agent.env.template");
+//                    log.info("Loaded default config from bundled agent.env.template");
                 }
             } catch (IOException e) {
                 log.warn("Unable to load bundled defaults: {}", e.getMessage());

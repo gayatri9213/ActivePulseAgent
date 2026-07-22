@@ -110,7 +110,7 @@ public final class WindowsActiveWindowTracker implements ActiveWindowTracker {
     public ActiveWindowInfo getActiveWindow() {
         try {
             HWND hwnd = User32.INSTANCE.GetForegroundWindow();
-            if (hwnd == null) return ActiveWindowInfo.unknown();
+            if (hwnd == null) return new ActiveWindowInfo("class:SecureDesktop", "", "");
 
             // Title
             char[] buf = new char[1024];

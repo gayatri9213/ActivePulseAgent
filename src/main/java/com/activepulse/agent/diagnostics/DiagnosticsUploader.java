@@ -1,6 +1,7 @@
 package com.activepulse.agent.diagnostics;
 
 import com.activepulse.agent.monitor.AppConfigManager;
+import com.activepulse.agent.util.AgentMode;
 import com.activepulse.agent.util.EnvConfig;
 import com.activepulse.agent.util.PathResolver;
 import org.slf4j.Logger;
@@ -23,11 +24,8 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -132,6 +130,10 @@ public final class DiagnosticsUploader {
      * Best-effort: any failure is logged; agent shutdown continues.
      */
     public void uploadOnShutdown() {
+        if (AgentMode.isTest()) {
+            log.info("TEST MODE - diagnostics upload skipped. Logs remain on local disk only.");
+            return;
+        }
         try {
             log.info("Diagnostics: shutdown upload starting...");
             LocalDate today     = LocalDate.now();
@@ -169,6 +171,10 @@ public final class DiagnosticsUploader {
      *   - ALWAYS backfill any unsynced days from the last 7 days.
      */
     public void uploadDailyFallback() {
+        if (AgentMode.isTest()) {
+            log.info("TEST MODE - diagnostics fallback skipped. Logs remain on local disk only.");
+            return;
+        }
         try {
             log.info("Diagnostics: 12 PM fallback starting...");
             LocalDate today = LocalDate.now();

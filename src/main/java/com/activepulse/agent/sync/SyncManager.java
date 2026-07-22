@@ -2,10 +2,7 @@ package com.activepulse.agent.sync;
 
 import com.activepulse.agent.db.DatabaseManager;
 import com.activepulse.agent.monitor.AppConfigManager;
-import com.activepulse.agent.util.EnvConfig;
-import com.activepulse.agent.util.MachineInfo;
-import com.activepulse.agent.util.OsType;
-import com.activepulse.agent.util.TimeUtil;
+import com.activepulse.agent.util.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.slf4j.Logger;
@@ -82,6 +79,11 @@ public final class SyncManager {
     // ─── Main sync ───────────────────────────────────────────────────
 
     public void sync() {
+        if (AgentMode.isTest()) {
+            log.warn("TEST MODE - sync disabled. Data is captured to the test DB "
+                    + "but will NOT be uploaded to the portal.");
+            return;
+        }
         log.info(SEP);
         log.info("  Sync cycle -- server configured: {}", isConfigured());
 
@@ -257,8 +259,8 @@ public final class SyncManager {
                     location.get("longitude"),
                     location.get("privateIp"),
                     location.get("publicIp"));
-            log.info("  Payload built -- activity rows: {}, stroke rows: {}",
-                    activityLog.size(), strokes.size());
+//            log.info("  Payload built -- activity rows: {}, stroke rows: {}",
+//                    activityLog.size(), strokes.size());
             return p;
         } catch (Exception e) {
             log.error("buildDataPayload failed: {}", e.getMessage());
@@ -411,8 +413,8 @@ public final class SyncManager {
                 // Release the JSON bytes as soon as send completes
                 jsonBytes = null;
 
-                log.info("POST /api/sync/data chunk {}/{} -> HTTP {} ({} bytes response)",
-                        (i + 1), totalChunks, status, body == null ? 0 : body.length());
+//                log.info("POST /api/sync/data chunk {}/{} -> HTTP {} ({} bytes response)",
+//                        (i + 1), totalChunks, status, body == null ? 0 : body.length());
 
                 if (status != 200) {
                     log.warn("Chunk {} failed: {}", (i + 1), truncate(body, 300));
