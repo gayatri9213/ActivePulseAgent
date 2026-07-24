@@ -31,6 +31,11 @@ public final class ScreenshotCapture {
     private ScreenshotCapture() {}
 
     public static void captureNow() {
+        // Server-controlled screenshot setting
+        if (!AppConfigManager.getInstance().isScreenshotsEnabled()) {
+            log.debug("Screenshots are disabled by server settings. Skipping capture.");
+            return;
+        }
         if (GraphicsEnvironment.isHeadless()) {
             log.warn("Headless environment — cannot capture screenshot.");
             return;

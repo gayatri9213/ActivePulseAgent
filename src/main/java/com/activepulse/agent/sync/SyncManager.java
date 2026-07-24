@@ -102,7 +102,8 @@ public final class SyncManager {
         if (dataPayload != null) {
             if (isConfigured()) {
                 dataSyncSuccess = postDataPayload(dataPayload, syncId);
-                if (dataSyncSuccess) {
+                if (dataSyncSuccess &&
+                        AppConfigManager.getInstance().isScreenshotsEnabled()) {
                     markSynced(conn, "activity_log",           activityIds);
                     markSynced(conn, "keyboard_mouse_strokes", strokeIds);
                     log.info("  Data sync completed successfully.");
@@ -410,12 +411,26 @@ public final class SyncManager {
                 int status = resp.statusCode();
                 String body = resp.body();
 
-                // Release the JSON bytes as soon as send completes
-                jsonBytes = null;
 
 //                log.info("POST /api/sync/data chunk {}/{} -> HTTP {} ({} bytes response)",
 //                        (i + 1), totalChunks, status, body == null ? 0 : body.length());
 
+                if (status == 200 && body != null && !body.isBlank()) {
+
+                    SyncResponse response = mapper.readValue(body, SyncResponse.class);
+
+                    if (response.getSettings() != null) {
+
+                        AppConfigManager config = AppConfigManager.getInstance();
+
+                        config.setLogsEnabled(response.getSettings().isLogsEnabled());
+                        config.setScreenshotsEnabled(response.getSettings().isScreenshotsEnabled());
+
+                        log.info("Server Settings -> logsEnabled={}, screenshotsEnabled={}",
+                                config.isLogsEnabled(),
+                                config.isScreenshotsEnabled());
+                    }
+                }
                 if (status != 200) {
                     log.warn("Chunk {} failed: {}", (i + 1), truncate(body, 300));
                     return false;

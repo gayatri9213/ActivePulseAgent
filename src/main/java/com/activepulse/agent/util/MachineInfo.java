@@ -27,30 +27,35 @@ import java.util.stream.Collectors;
 /**
  * Builds the nested `location` block sent in each sync payload.
  *
- * v1.0.3 CHANGES:
- *  - Office subnet override now supports multiple offices (Pune + Nashik + more)
- *  - All subnets configurable via agent.env (no hardcoded lists)
- *  - Defaults match Aress's known subnets
- *  - PowerShell completely removed (AVG IDP.HELU.PSE79 fix)
+ * v1.0.8 CHANGES:
+ *  - matchesAnySubnet() now does REAL CIDR matching (e.g. 10.179.0.0/16),
+ *    while still accepting bare octet prefixes ("192.168.30") for back-compat.
+ *  - IP fallback restored to two providers: ip-api.com (JSON, primary) then
+ *    ipgeolocation.io (HTML scrape, secondary). Fixes blank 0.0/0.0 result
+ *    when a WFH machine's subnet does not match any office.
+ *  - Last-known-good cache: if every live method fails this cycle, reuse the
+ *    previous resolved location instead of emitting blank/zero coordinates.
+ *  - locationSource tag added to the payload so the portal can tell an exact
+ *    office fix from an approximate IP fix:
+ *      OFFICE_EXACT | GEO_APPROX | IP_APPROX | LAST_KNOWN | UNRESOLVED
  *
- * Subnet → office mapping (defaults; override in agent.env):
+ * Subnet -> office mapping (defaults; override in agent.env):
  *   PUNE:    192.168.30
  *   NASHIK:  192.168.210, 192.168.137, 192.168.8, 192.168.9
- *   EXTRA:   192.168.70, 192.168.60  (assigned to OFFICE_EXTRA_* — set the
- *                                     OFFICE_EXTRA_* env vars to whichever
- *                                     city these subnets actually belong to)
+ *   EXTRA:   192.168.70, 192.168.60
  *
  * Output format:
  *   {
- *     "address":   "Pune, Maharashtra, India",
- *     "latitude":  18.511033,
- *     "longitude": 73.925595,
- *     "city":      "Pune",
- *     "region":    "Maharashtra",
- *     "country":   "India",
- *     "zip":       "",
- *     "publicIp":  "114.143.178.130",
- *     "privateIp": "192.168.30.116"
+ *     "address":        "Pune, Maharashtra, India",
+ *     "latitude":       18.511033,
+ *     "longitude":      73.925595,
+ *     "city":           "Pune",
+ *     "region":         "Maharashtra",
+ *     "country":        "India",
+ *     "zip":            "",
+ *     "publicIp":       "114.143.178.130",
+ *     "privateIp":      "192.168.30.116",
+ *     "locationSource": "OFFICE_EXACT"
  *   }
  */
 public final class MachineInfo {
@@ -68,6 +73,10 @@ public final class MachineInfo {
 
     private static volatile Map<String, Object> cachedLocation;
     private static volatile Instant cachedAt;
+
+    // Last successfully-resolved location (non-blank city). Survives across
+    // cycles so a fully-failed lookup can reuse it instead of returning blanks.
+    private static volatile Map<String, Object> lastGoodLocation;
 
     private MachineInfo() {}
 
@@ -98,36 +107,65 @@ public final class MachineInfo {
 
     private static Map<String, Object> buildLocationPayload() {
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("address",   "");
-        result.put("latitude",  0.0);
-        result.put("longitude", 0.0);
-        result.put("city",      "");
-        result.put("region",    "");
-        result.put("country",   "");
-        result.put("zip",       "");
-        result.put("publicIp",  "");
-        result.put("privateIp", getPrivateIp());
+        result.put("address",        "");
+        result.put("latitude",       0.0);
+        result.put("longitude",      0.0);
+        result.put("city",           "");
+        result.put("region",         "");
+        result.put("country",        "");
+        result.put("zip",            "");
+        result.put("publicIp",       "");
+        result.put("privateIp",      getPrivateIp());
+        result.put("locationSource", "UNRESOLVED");
 
-        // 1) OFFICE OVERRIDE — runs FIRST. If private IP matches a known
-        //    office subnet, force those coords. No geocoding wait, no
-        //    wrong-Mumbai problem.
-        boolean isOffice = applyOfficeOverride(result);
+        // 1) OFFICE OVERRIDE — exact, guaranteed, no network/permission needed.
+        if (applyOfficeOverride(result)) {
+            result.put("locationSource", "OFFICE_EXACT");
+            lastGoodLocation = new LinkedHashMap<>(result);
+            return result;
+        }
 
-        // 2) For WFH users, try Google Geolocation (skipped if at office).
-        if (!isOffice) {
-            double[] preciseCoords = getCoordinatesFromGoogleGeolocation();
-            if (preciseCoords != null) {
-                result.put("latitude",  preciseCoords[0]);
-                result.put("longitude", preciseCoords[1]);
-                log.info("Google Geolocation -> {}, {}", preciseCoords[0], preciseCoords[1]);
-                tryReverseGeocode(preciseCoords[0], preciseCoords[1], result);
+        // 2) WFH: optional Google Geolocation (only if API key configured).
+        double[] preciseCoords = getCoordinatesFromGoogleGeolocation();
+        if (preciseCoords != null) {
+            result.put("latitude",  preciseCoords[0]);
+            result.put("longitude", preciseCoords[1]);
+            log.info("Google Geolocation -> {}, {}", preciseCoords[0], preciseCoords[1]);
+            if (tryReverseGeocode(preciseCoords[0], preciseCoords[1], result)) {
+                result.put("locationSource", "GEO_APPROX");
             }
         }
 
-        // 3) IP fallback ALWAYS runs to record publicIp.
-        //    Only overwrites city/coords if we don't already have them.
+        // 3) IP fallback: ALWAYS records publicIp; fills city/coords if blank.
         boolean cityBlank = ((String) result.get("city")).isBlank();
-        tryIpFallback(result, cityBlank && !isOffice);
+        tryIpFallback(result, cityBlank);
+        if ("UNRESOLVED".equals(result.get("locationSource"))
+                && !((String) result.get("city")).isBlank()) {
+            result.put("locationSource", "IP_APPROX");
+        }
+
+        // 4) Everything failed this cycle -> reuse last known good so we never
+        //    emit blank city / 0.0 coordinates. Location is stable between the
+        //    5-minute syncs, so the previous fix is the best available answer.
+        if (((String) result.get("city")).isBlank() && lastGoodLocation != null) {
+            Map<String, Object> reused = new LinkedHashMap<>(lastGoodLocation);
+            // Keep THIS cycle's freshly captured IPs if we have them.
+            String freshPublic  = (String) result.get("publicIp");
+            String freshPrivate = (String) result.get("privateIp");
+            if (freshPublic  != null && !freshPublic.isBlank())  reused.put("publicIp",  freshPublic);
+            if (freshPrivate != null && !freshPrivate.isBlank()) reused.put("privateIp", freshPrivate);
+            reused.put("locationSource", "LAST_KNOWN");
+            log.warn("Location unresolved this cycle; reusing last known good ({})",
+                    reused.get("city"));
+            return reused;
+        }
+
+        // Remember a fresh, real resolution for future fallback.
+        if (!((String) result.get("city")).isBlank()) {
+            lastGoodLocation = new LinkedHashMap<>(result);
+        } else {
+            log.warn("Location fully unresolved this cycle and no last-known-good available");
+        }
 
         return result;
     }
@@ -137,14 +175,6 @@ public final class MachineInfo {
     /**
      * Checks the private IP against known office subnets and overrides
      * location with authoritative office coordinates if matched.
-     *
-     * Three offices supported via agent.env:
-     *   OFFICE_PUNE_SUBNETS
-     *   OFFICE_NASHIK_SUBNETS
-     *   OFFICE_EXTRA_SUBNETS (and OFFICE_EXTRA_CITY/REGION/COUNTRY/LAT/LNG)
-     *
-     * Subnet matching uses prefix on first 3 octets, comma-separated.
-     * Trailing dot is auto-added so "192.168.30" matches "192.168.30.X" only.
      *
      * @return true if private IP matched a known office, false otherwise
      */
@@ -161,7 +191,7 @@ public final class MachineInfo {
             result.put("address",   "Pune, Maharashtra, India");
             result.put("latitude",  EnvConfig.getDouble("OFFICE_PUNE_LAT", 18.511033));
             result.put("longitude", EnvConfig.getDouble("OFFICE_PUNE_LNG", 73.925595));
-            log.info("Office subnet match: {} → Pune (forced)", privateIp);
+            log.info("Office subnet match: {} -> Pune (forced)", privateIp);
             return true;
         }
 
@@ -176,13 +206,12 @@ public final class MachineInfo {
             result.put("address",   "Nashik, Maharashtra, India");
             result.put("latitude",  EnvConfig.getDouble("OFFICE_NASHIK_LAT", 19.9975));
             result.put("longitude", EnvConfig.getDouble("OFFICE_NASHIK_LNG", 73.7898));
-            log.info("Office subnet match: {} → Nashik (forced)", privateIp);
+            log.info("Office subnet match: {} -> Nashik (forced)", privateIp);
             return true;
         }
 
-        // EXTRA — for unknown-city subnets (192.168.70, 192.168.60).
-        // Defaults to Pune coords. Reassign in agent.env if these are a
-        // different office.
+        // EXTRA — for unknown-city subnets. Defaults to Pune coords; reassign
+        // via agent.env if these belong to a different office.
         String extraSubnets = EnvConfig.get(
                 "OFFICE_EXTRA_SUBNETS",
                 "192.168.70,192.168.60").trim();
@@ -196,7 +225,7 @@ public final class MachineInfo {
             result.put("address",   city + ", " + region + ", " + country);
             result.put("latitude",  EnvConfig.getDouble("OFFICE_EXTRA_LAT", 18.511033));
             result.put("longitude", EnvConfig.getDouble("OFFICE_EXTRA_LNG", 73.925595));
-            log.info("Office subnet match: {} → {} (extra, forced)", privateIp, city);
+            log.info("Office subnet match: {} -> {} (extra, forced)", privateIp, city);
             return true;
         }
 
@@ -205,53 +234,92 @@ public final class MachineInfo {
     }
 
     /**
-     * Returns true if {@code privateIp} starts with any of the comma-separated
-     * subnet prefixes in {@code subnetsCsv}.
+     * True if {@code ip} falls inside any of the comma-separated entries.
      *
-     * Accepts both formats:
-     *   "192.168.30"          (prefix-only)
-     *   "192.168.30.0/24"     (CIDR — only first 3 octets used for matching)
+     * Each entry may be:
+     *   "10.179.0.0/16"   real CIDR (any prefix length 0-32)
+     *   "192.168.30.0/24" real CIDR
+     *   "192.168.30"      bare octet prefix (matches 192.168.30.*)  [back-compat]
+     *   "192.168.30.15"   full IP (exact /32 match)
      *
-     * Each prefix is matched as "prefix." (with trailing dot) to avoid
-     * "192.168.3" wrongly matching "192.168.30.x".
+     * Malformed entries are skipped, not fatal.
      */
-    private static boolean matchesAnySubnet(String privateIp, String subnetsCsv) {
-        if (subnetsCsv == null || subnetsCsv.isBlank()) return false;
-        for (String prefix : subnetsCsv.split(",")) {
-            String p = prefix.trim();
-            if (p.isEmpty()) continue;
-            // Strip CIDR suffix if present (/24 etc.)
-            int slash = p.indexOf('/');
-            if (slash > 0) {
-                p = p.substring(0, slash);
+    private static boolean matchesAnySubnet(String ip, String subnetsCsv) {
+        if (ip == null || ip.isBlank() || subnetsCsv == null || subnetsCsv.isBlank()) {
+            return false;
+        }
+        long ipLong;
+        try {
+            ipLong = ipToLong(ip);
+        } catch (Exception e) {
+            return false; // not a parseable IPv4 (e.g. IPv6) — cannot match
+        }
+
+        for (String raw : subnetsCsv.split(",")) {
+            String entry = raw.trim();
+            if (entry.isEmpty()) continue;
+            try {
+                if (entry.contains("/")) {
+                    // Real CIDR: network/bits
+                    String[] parts = entry.split("/");
+                    int bits = Integer.parseInt(parts[1].trim());
+                    if (bits < 0 || bits > 32) continue;
+                    long net  = ipToLong(padToFullIp(parts[0].trim()));
+                    long mask = (bits == 0) ? 0L : (0xFFFFFFFFL << (32 - bits)) & 0xFFFFFFFFL;
+                    if ((ipLong & mask) == (net & mask)) return true;
+                } else {
+                    int octetCount = entry.split("\\.").length;
+                    if (octetCount == 4) {
+                        // Full IP -> exact match
+                        if (ipToLong(entry) == ipLong) return true;
+                    } else {
+                        // Bare prefix ("192.168.30") -> leading-octet prefix match.
+                        String p = entry.endsWith(".") ? entry : entry + ".";
+                        if (ip.startsWith(p)) return true;
+                    }
+                }
+            } catch (Exception ignore) {
+                log.debug("Skipping malformed subnet entry: '{}'", entry);
             }
-            // Strip trailing .0 if present (CIDR network format)
-            if (p.endsWith(".0")) {
-                p = p.substring(0, p.length() - 2);
-            }
-            // Ensure trailing dot to prevent "192.168.3" matching "192.168.30.x"
-            if (!p.endsWith(".")) p = p + ".";
-            if (privateIp.startsWith(p)) return true;
         }
         return false;
+    }
+
+    /** Convert dotted IPv4 to an unsigned 32-bit value held in a long. */
+    private static long ipToLong(String ip) {
+        String[] o = ip.trim().split("\\.");
+        if (o.length != 4) throw new IllegalArgumentException("not IPv4: " + ip);
+        long v = 0;
+        for (int i = 0; i < 4; i++) {
+            int part = Integer.parseInt(o[i].trim());
+            if (part < 0 || part > 255) throw new IllegalArgumentException("bad octet: " + ip);
+            v = (v << 8) | part;
+        }
+        return v & 0xFFFFFFFFL;
+    }
+
+    /** "10.179" -> "10.179.0.0"; "10.179.0.0" stays. Used for CIDR network part. */
+    private static String padToFullIp(String maybePartial) {
+        String[] o = maybePartial.trim().split("\\.");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 4; i++) {
+            if (i > 0) sb.append('.');
+            sb.append(i < o.length && !o[i].isBlank() ? o[i].trim() : "0");
+        }
+        return sb.toString();
     }
 
     // ─── Reverse geocoding ───────────────────────────────────────────
 
     private static boolean tryReverseGeocode(double lat, double lon,
                                              Map<String, Object> result) {
-
         String apiKey = EnvConfig.get("GOOGLE_GEOCODING_API_KEY", "").trim();
-
-        if (apiKey.isBlank()) {
-            return false;
-        }
-
+        if (apiKey.isBlank()) return false;
         return tryGoogleGeocode(lat, lon, apiKey, result);
     }
 
     private static boolean tryGoogleGeocode(double lat, double lon, String apiKey,
-                                             Map<String, Object> result) {
+                                            Map<String, Object> result) {
         try {
             String url = String.format(
                     "https://maps.googleapis.com/maps/api/geocode/json?latlng=%f,%f&key=%s",
@@ -298,7 +366,7 @@ public final class MachineInfo {
                 for (JsonNode component : components) {
                     JsonNode types = component.path("types");
                     if (containsType(types, "sublocality") ||
-                        containsType(types, "administrative_area_level_2")) {
+                            containsType(types, "administrative_area_level_2")) {
                         city = component.path("long_name").asText("");
                         if (!city.isBlank()) break;
                     }
@@ -327,7 +395,6 @@ public final class MachineInfo {
         }
         return false;
     }
-
 
     // ─── Google Geolocation API ──────────────────────────────────────
 
@@ -363,11 +430,58 @@ public final class MachineInfo {
 
     // ─── IP-based fallback ───────────────────────────────────────────
 
-    private static void tryIpFallback(Map<String, Object> result,
-                                      boolean overwriteCoords) {
+    /**
+     * Two-provider IP fallback:
+     *   1. ip-api.com        (single JSON GET, no key, no scraping) — PRIMARY
+     *   2. ipgeolocation.io  (HTML scrape; fragile) — SECONDARY
+     * Always records publicIp; only overwrites city/coords when overwriteCoords.
+     */
+    private static void tryIpFallback(Map<String, Object> result, boolean overwriteCoords) {
+        if (tryIpApiFallback(result, overwriteCoords)) return;
+        log.warn("ip-api.com unavailable; trying ipgeolocation.io");
+        if (tryIpGeolocationPage(result, overwriteCoords)) return;
+        log.warn("All IP geolocation providers failed; location left blank this cycle.");
+    }
 
-        if (!tryIpGeolocationPage(result, overwriteCoords)) {
-            log.warn("IPGeolocation.io lookup failed.");
+    /** ip-api.com — reliable JSON, no API key, no HTML scraping. */
+    private static boolean tryIpApiFallback(Map<String, Object> result, boolean overwriteCoords) {
+        try {
+            String response = httpGet(
+                    "http://ip-api.com/json/?fields=status,message,country,"
+                            + "regionName,city,zip,lat,lon,query", null);
+            if (response == null || response.isBlank()) return false;
+
+            JsonNode node = mapper.readTree(response);
+            if (!"success".equals(node.path("status").asText())) {
+                log.debug("ip-api.com status={}", node.path("message").asText(""));
+                return false;
+            }
+
+            result.put("publicIp", node.path("query").asText(""));
+
+            if (overwriteCoords) {
+                String city    = node.path("city").asText("");
+                String region  = node.path("regionName").asText("");
+                String country = node.path("country").asText("");
+                result.put("city",      city);
+                result.put("region",    region);
+                result.put("country",   country);
+                result.put("zip",       node.path("zip").asText(""));
+                result.put("address",   buildAddress(city, region, country));
+                result.put("latitude",  node.path("lat").asDouble(0.0));
+                result.put("longitude", node.path("lon").asDouble(0.0));
+            }
+
+            log.info("ip-api.com resolved {} -> {}, {}, {} ({},{}) overwriteCoords={}",
+                    result.get("publicIp"),
+                    node.path("city").asText(""), node.path("regionName").asText(""),
+                    node.path("country").asText(""),
+                    node.path("lat").asDouble(0.0), node.path("lon").asDouble(0.0),
+                    overwriteCoords);
+            return true;
+        } catch (Exception e) {
+            log.warn("ip-api.com lookup failed: {}", e.getMessage());
+            return false;
         }
     }
 
@@ -405,16 +519,14 @@ public final class MachineInfo {
                 result.put("longitude", location.path("longitude").asDouble(0.0));
             }
 
-            log.info("IPGeolocation.io resolved {} → {}, {}, {} (overwriteCoords={})",
+            log.info("ipgeolocation.io resolved {} -> {}, {}, {} (overwriteCoords={})",
                     result.get("publicIp"), city, region, country, overwriteCoords);
             return true;
         } catch (Exception e) {
-            log.warn("IPGeolocation.io lookup failed: {}", e.getMessage());
+            log.warn("ipgeolocation.io lookup failed: {}", e.getMessage());
             return false;
         }
     }
-
-
 
     // ─── Private IP discovery ────────────────────────────────────────
 

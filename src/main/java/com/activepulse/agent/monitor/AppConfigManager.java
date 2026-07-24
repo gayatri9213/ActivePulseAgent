@@ -11,6 +11,9 @@ public final class AppConfigManager {
     private static final Logger log = LoggerFactory.getLogger(AppConfigManager.class);
     private static volatile AppConfigManager instance;
 
+    private volatile boolean logsEnabled = true;
+    private volatile boolean screenshotsEnabled = true;
+
     private final String username;         // Full qualified: DOMAIN\\user
     private final String usernameShort;    // Just user, no domain
     private final String domain;
@@ -68,4 +71,20 @@ public final class AppConfigManager {
     public String getDeviceId() { return deviceId; }
     public OsType getOs()       { return os; }
     public String getUserSource() { return userSource; }
+
+    public boolean isLogsEnabled() {
+        return logsEnabled;
+    }
+
+    public void setLogsEnabled(boolean logsEnabled) {
+        this.logsEnabled = logsEnabled;
+    }
+
+    public boolean isScreenshotsEnabled() {
+        return screenshotsEnabled;
+    }
+
+    public void setScreenshotsEnabled(boolean screenshotsEnabled) {
+        this.screenshotsEnabled = screenshotsEnabled;
+    }
 }

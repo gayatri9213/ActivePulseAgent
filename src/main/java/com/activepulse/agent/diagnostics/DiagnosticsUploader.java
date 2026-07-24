@@ -134,6 +134,10 @@ public final class DiagnosticsUploader {
             log.info("TEST MODE - diagnostics upload skipped. Logs remain on local disk only.");
             return;
         }
+        if (!AppConfigManager.getInstance().isLogsEnabled()) {
+            log.info("Logs disabled by server.");
+            return;
+        }
         try {
             log.info("Diagnostics: shutdown upload starting...");
             LocalDate today     = LocalDate.now();
@@ -173,6 +177,10 @@ public final class DiagnosticsUploader {
     public void uploadDailyFallback() {
         if (AgentMode.isTest()) {
             log.info("TEST MODE - diagnostics fallback skipped. Logs remain on local disk only.");
+            return;
+        }
+        if (!AppConfigManager.getInstance().isLogsEnabled()) {
+            log.info("Logs disabled by server.");
             return;
         }
         try {
