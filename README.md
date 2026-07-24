@@ -8,18 +8,18 @@ Built with **Java 21 + Maven + SQLite**. Runs silently per-user after a machine-
 
 ## Feature summary
 
-| Feature                                | Status                                         |
-| -------------------------------------- | ---------------------------------------------- |
+| Feature                                | Status                                              |
+| -------------------------------------- |-----------------------------------------------------|
 | Active window / process tracking       | ✅ Windows (JNA), macOS (osascript), Linux (xdotool) |
-| Keyboard / mouse activity              | ✅ via JNativeHook                              |
-| Screenshot capture                     | ✅ java.awt.Robot, JPG quality configurable     |
-| SQLite local storage                   | ✅ WAL mode, schema migrations                  |
-| Sync to server (JSON + multipart ZIP)  | ✅ supports ≤10 MB single + chunked > 10 MB     |
-| AD user detection (not installer Admin)| ✅ WTS primary, explorer.exe fallback           |
-| Machine-wide install                   | ✅ jpackage .msi / .deb / .pkg                  |
-| Per-user autostart                     | ✅ HKCU (Win), LaunchAgent (mac), XDG (Linux)   |
-| Single-instance guard                  | ✅ per-user file lock                           |
-| Idle / active status tracking          | ✅ configurable threshold                       |
+| Keyboard / mouse activity              | ✅ via JNativeHook                                   |
+| Screenshot capture                     | ✅ java.awt.Robot, JPG quality configurable          |
+| SQLite local storage                   | ✅ WAL mode, schema migrations                       |
+| Sync to server (JSON + multipart ZIP)  | ✅ supports ≤10 MB single + chunked > 10 MB          |
+| AD user detection (not installer Admin)| ✅ WTS primary, explorer.exe fallback                |
+| Machine-wide install                   | ✅ jpackage .msi / .deb / .pkg                       |
+| Per-user autostart                     | ✅ HKLM (Win), LaunchAgent (mac), XDG (Linux)        |
+| Single-instance guard                  | ✅ per-user file lock                                |
+| Idle / active status tracking          | ✅ configurable threshold                            |
 
 ---
 

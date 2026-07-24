@@ -238,13 +238,16 @@ public final class MachineInfo {
 
     // ─── Reverse geocoding ───────────────────────────────────────────
 
-    private static boolean tryReverseGeocode(double lat, double lon, Map<String, Object> result) {
+    private static boolean tryReverseGeocode(double lat, double lon,
+                                             Map<String, Object> result) {
+
         String apiKey = EnvConfig.get("GOOGLE_GEOCODING_API_KEY", "").trim();
-        if (!apiKey.isBlank()) {
-            if (tryGoogleGeocode(lat, lon, apiKey, result)) return true;
-            log.warn("Google Geocoding failed -- falling back to Nominatim");
+
+        if (apiKey.isBlank()) {
+            return false;
         }
-        return tryNominatimGeocode(lat, lon, result);
+
+        return tryGoogleGeocode(lat, lon, apiKey, result);
     }
 
     private static boolean tryGoogleGeocode(double lat, double lon, String apiKey,
@@ -325,40 +328,6 @@ public final class MachineInfo {
         return false;
     }
 
-    private static boolean tryNominatimGeocode(double lat, double lon, Map<String, Object> result) {
-        try {
-            String url = String.format(
-                    "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=%f&lon=%f&zoom=14&addressdetails=1",
-                    lat, lon);
-            String response = httpGet(url, "ActivePulse/1.0 (contact: support@aress.com)");
-            if (response == null || response.isBlank()) return false;
-
-            JsonNode root = mapper.readTree(response);
-            JsonNode address = root.path("address");
-            if (address.isMissingNode()) return false;
-
-            String city = firstNonEmpty(
-                    address.path("city").asText(""),
-                    address.path("town").asText(""),
-                    address.path("village").asText(""),
-                    address.path("municipality").asText(""),
-                    address.path("suburb").asText(""),
-                    address.path("county").asText(""));
-            if (city.isBlank()) return false;
-
-            result.put("city",    city);
-            result.put("region",  address.path("state").asText(""));
-            result.put("country", address.path("country").asText(""));
-            result.put("zip",     address.path("postcode").asText(""));
-            result.put("address", root.path("display_name").asText(city));
-            log.info("Nominatim geocoded {},{} -> {}, {}, {}",
-                    lat, lon, city, result.get("region"), result.get("country"));
-            return true;
-        } catch (Exception e) {
-            log.warn("Nominatim geocode failed: {}", e.getMessage());
-            return false;
-        }
-    }
 
     // ─── Google Geolocation API ──────────────────────────────────────
 
@@ -394,10 +363,12 @@ public final class MachineInfo {
 
     // ─── IP-based fallback ───────────────────────────────────────────
 
-    private static void tryIpFallback(Map<String, Object> result, boolean overwriteCoords) {
-        if (tryIpGeolocationPage(result, overwriteCoords)) return;
-        log.warn("IPGeolocation.io unavailable; using ip-api.com fallback");
-        tryIpApiFallback(result, overwriteCoords);
+    private static void tryIpFallback(Map<String, Object> result,
+                                      boolean overwriteCoords) {
+
+        if (!tryIpGeolocationPage(result, overwriteCoords)) {
+            log.warn("IPGeolocation.io lookup failed.");
+        }
     }
 
     private static boolean tryIpGeolocationPage(Map<String, Object> result, boolean overwriteCoords) {
@@ -443,32 +414,7 @@ public final class MachineInfo {
         }
     }
 
-    private static void tryIpApiFallback(Map<String, Object> result, boolean overwriteCoords) {
-        try {
-            String response = httpGet(
-                    "http://ip-api.com/json/?fields=status,message,country,"
-                            + "region,regionName,city,zip,lat,lon,query", null);
-            if (response == null || response.isBlank()) return;
 
-            JsonNode node = mapper.readTree(response);
-            if (!"success".equals(node.path("status").asText())) return;
-
-            result.put("publicIp", node.path("query").asText(""));
-
-            if (overwriteCoords) {
-                String city = node.path("city").asText("");
-                result.put("city",      city);
-                result.put("region",    node.path("regionName").asText(""));
-                result.put("country",   node.path("country").asText(""));
-                result.put("zip",       node.path("zip").asText(""));
-                result.put("address",   city);
-                result.put("latitude",  node.path("lat").asDouble(0.0));
-                result.put("longitude", node.path("lon").asDouble(0.0));
-            }
-        } catch (Exception e) {
-            log.warn("IP geolocation failed: {}", e.getMessage());
-        }
-    }
 
     // ─── Private IP discovery ────────────────────────────────────────
 
@@ -560,11 +506,6 @@ public final class MachineInfo {
         } finally {
             if (conn != null) conn.disconnect();
         }
-    }
-
-    private static String firstNonEmpty(String... values) {
-        for (String v : values) if (v != null && !v.isBlank()) return v;
-        return "";
     }
 
     private static String buildAddress(String city, String region, String country) {
