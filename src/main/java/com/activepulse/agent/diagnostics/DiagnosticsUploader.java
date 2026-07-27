@@ -72,6 +72,10 @@ public final class DiagnosticsUploader {
 
     private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_CATCHUP_DAYS = 7;
+
+    // Single upload if ZIP <= 10 MB; otherwise chunked at 5 MB per part.
+    private static final long LOG_THRESHOLD_BYTES  = 10L * 1024 * 1024;
+    private static final long LOG_CHUNK_SIZE_BYTES =  5L * 1024 * 1024;
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
     private static final DateTimeFormatter TS_FMT   = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -263,6 +267,20 @@ public final class DiagnosticsUploader {
                 }
 
                 byte[] slice = readByteRange(logFile, previousOffset, currentSize);
+
+                if (warnErrorOnly()) {
+                    slice = filterWarnError(slice);
+                    if (slice.length == 0) {
+                        // No WARN/ERROR in the new bytes — advance the offset so we
+                        // don't re-scan them, but send nothing.
+                        log.info("Warn/error-only: no WARN/ERROR in new bytes for {} "
+                                + "- advancing offset, nothing to upload", dateKey);
+                        lastOffsets.put(dateKey, currentSize);
+                        saveState();
+                        return true;
+                    }
+                }
+
                 String chunkTag = buildChunkTag(triggerTag);
                 String sliceFileName = String.format("agent.%s.%s.log", dateKey, chunkTag);
                 Path zipFile = zipSlice(sliceFileName, slice, dateKey, chunkTag);
@@ -282,7 +300,23 @@ public final class DiagnosticsUploader {
 
             } else {
                 // Full file upload for older days
-                Path zipFile = zipWholeFile(logFile, dateKey);
+                Path zipFile;
+                if (warnErrorOnly()) {
+                    byte[] filtered = filterWarnError(Files.readAllBytes(logFile));
+                    if (filtered.length == 0) {
+                        // No errors that whole day — mark done, upload nothing.
+                        log.info("Warn/error-only: no WARN/ERROR for {} "
+                                + "- marking synced, nothing to upload", dateKey);
+                        syncedDates.add(dateKey);
+                        lastOffsets.remove(dateKey);
+                        saveState();
+                        return true;
+                    }
+                    zipFile = zipSlice(String.format("agent.%s.warnerror.log", dateKey),
+                            filtered, dateKey, "warnerror");
+                } else {
+                    zipFile = zipWholeFile(logFile, dateKey);
+                }
                 String syncId = "sync-" + UUID.randomUUID().toString().substring(0, 12);
 
                 log.info("Built diagnostics ZIP for {}: {} bytes, 1 file(s)",
@@ -339,6 +373,38 @@ public final class DiagnosticsUploader {
         } catch (IOException e) {
             return null;
         }
+    }
+
+    /** When true, uploads keep only WARN/ERROR entries; the on-disk log is untouched. */
+    private boolean warnErrorOnly() {
+        return EnvConfig.getBool("DIAGNOSTICS_WARN_ERROR_ONLY", false);
+    }
+
+    // A log entry starts with: "yyyy-MM-dd HH:mm:ss.SSS [thread] LEVEL logger - msg"
+    private static final java.util.regex.Pattern LOG_ENTRY_START =
+            java.util.regex.Pattern.compile(
+                    "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} \\[.*?\\] (\\w+)\\b");
+
+    /**
+     * Keeps only WARN/ERROR entries and their continuation lines (stack traces,
+     * "Caused by", "\tat ..."). Lines with no entry-header inherit the level of
+     * the entry above them, so multi-line errors survive intact.
+     */
+    private byte[] filterWarnError(byte[] raw) {
+        if (raw == null || raw.length == 0) return raw;
+        String text = new String(raw, StandardCharsets.UTF_8);
+        StringBuilder out = new StringBuilder(raw.length / 2);
+        boolean keep = false; // is the CURRENT entry a WARN/ERROR?
+        for (String line : text.split("\n", -1)) {
+            java.util.regex.Matcher m = LOG_ENTRY_START.matcher(line);
+            if (m.find()) {
+                String level = m.group(1).toUpperCase();
+                keep = level.equals("WARN") || level.equals("ERROR");
+            }
+            // else: continuation line -> keep/drop with the current entry
+            if (keep) out.append(line).append('\n');
+        }
+        return out.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] readByteRange(Path file, long start, long end) throws IOException {
@@ -403,20 +469,28 @@ public final class DiagnosticsUploader {
             }
             return true;
         }
-        return realPost(zipFile, date, syncId);
+        try {
+            long size = Files.size(zipFile);
+            return size <= LOG_THRESHOLD_BYTES
+                    ? realPost(zipFile, date, syncId)
+                    : realPostChunked(zipFile, date, syncId);
+        } catch (IOException e) {
+            log.error("sendMultipart size check failed: {}", e.getMessage());
+            return false;
+        }
     }
 
     private boolean realPost(Path zipFile, LocalDate date, String syncId) {
         String endpoint = null;
         try {
-            String baseUrl = EnvConfig.get("SYNC_BASE_URL", "").trim();
+            String baseUrl = EnvConfig.get("SERVER_BASE_URL", "").trim();
             if (baseUrl.isBlank()) {
-                log.warn("SYNC_BASE_URL not configured — cannot upload diagnostics");
+                log.warn("SERVER_BASE_URL not configured — cannot upload diagnostics");
                 return false;
             }
             endpoint = baseUrl.endsWith("/")
-                    ? baseUrl + "api/api/sync/logs"
-                    : baseUrl + "/api/api/sync/logs";
+                    ? baseUrl + "api/sync/logs"
+                    : baseUrl + "/api/sync/logs";
 
             String username = "", deviceId = "";
             try {
@@ -497,6 +571,100 @@ public final class DiagnosticsUploader {
                         "(endpoint was {})", endpoint);
             } else {
                 log.warn("realPost failed for {}: {} - {}", endpoint, cls, msg);
+                log.debug("Full exception:", t);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Chunked diagnostics upload for large ZIPs.
+     * POSTs 5 MB parts to /api/api/sync/logs/chunk with fields:
+     *   uploadId, chunkIndex, totalChunks, username, deviceId, syncId, logs(file).
+     * Memory is bounded to one chunk at a time via RandomAccessFile.
+     */
+    private boolean realPostChunked(Path zipFile, LocalDate date, String syncId) {
+        String endpoint = null;
+        try (RandomAccessFile raf = new RandomAccessFile(zipFile.toFile(), "r")) {
+            String baseUrl = EnvConfig.get("SERVER_BASE_URL", "").trim();
+            if (baseUrl.isBlank()) {
+                log.warn("SERVER_BASE_URL not configured — cannot upload diagnostics");
+                return false;
+            }
+            endpoint = baseUrl.endsWith("/")
+                    ? baseUrl + "api/sync/logs/chunk"
+                    : baseUrl + "/api/sync/logs/chunk";
+
+            String username = "", deviceId = "";
+            try {
+                AppConfigManager cfg = AppConfigManager.getInstance();
+                username = stripDomain(nullSafe(cfg.getUsername()));
+                deviceId = nullSafe(cfg.getDeviceId());
+            } catch (Throwable ignored) {}
+
+            long total       = raf.length();
+            int  totalChunks = (int) Math.ceil((double) total / LOG_CHUNK_SIZE_BYTES);
+            String uploadId  = UUID.randomUUID().toString();
+            String baseName  = zipFile.getFileName().toString();
+
+            log.info("Chunked diagnostics upload: {} chunks, {} KB total, uploadId={}",
+                    totalChunks, total / 1024, uploadId);
+
+            for (int i = 0; i < totalChunks; i++) {
+                long start     = (long) i * LOG_CHUNK_SIZE_BYTES;
+                long end       = Math.min(start + LOG_CHUNK_SIZE_BYTES, total);
+                int  chunkSize = (int) (end - start);
+
+                byte[] chunk = new byte[chunkSize];
+                raf.seek(start);
+                raf.readFully(chunk);
+
+                String boundary = "Boundary" + UUID.randomUUID().toString().replace("-", "");
+                ByteArrayOutputStream out = new ByteArrayOutputStream(chunkSize + 1024);
+                writeField(out, boundary, "uploadId",    uploadId);
+                writeField(out, boundary, "chunkIndex",  String.valueOf(i));
+                writeField(out, boundary, "totalChunks", String.valueOf(totalChunks));
+                writeField(out, boundary, "username",    username);
+                writeField(out, boundary, "deviceId",    deviceId);
+                writeField(out, boundary, "syncId",      syncId);
+                writeFilePart(out, boundary, "logs", baseName + ".part" + i, chunk);
+                out.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+
+                byte[] body = out.toByteArray();
+                chunk = null; // release before send
+
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(endpoint))
+                        .timeout(HTTP_TIMEOUT)
+                        .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                        .header("User-Agent", "ActivePulse/1.0")
+                        .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                        .build();
+
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                int code = resp.statusCode();
+                log.info("Diagnostics chunk {}/{} -> HTTP {}", i + 1, totalChunks, code);
+
+                if (code < 200 || code >= 300) {
+                    log.warn("Diagnostics chunk {} FAILED: HTTP {} — {}",
+                            i, code, truncate(resp.body() == null ? "" : resp.body(), 200));
+                    return false; // caller does not advance offset -> retried next cycle
+                }
+            }
+
+            log.info("Chunked diagnostics upload complete: date={} syncId={} uploadId={}",
+                    date, syncId, uploadId);
+            return true;
+
+        } catch (Throwable t) {
+            String cls = t.getClass().getSimpleName();
+            String msg = t.getMessage() == null ? "" : t.getMessage();
+            if (cls.contains("SSL") || msg.contains("PKIX")
+                    || msg.contains("UnknownHost") || msg.contains("ConnectException")) {
+                log.warn("Diagnostics chunk upload deferred: internet unavailable (endpoint {})",
+                        endpoint);
+            } else {
+                log.warn("realPostChunked failed for {}: {} - {}", endpoint, cls, msg);
                 log.debug("Full exception:", t);
             }
             return false;
