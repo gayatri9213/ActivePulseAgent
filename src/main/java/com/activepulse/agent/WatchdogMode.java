@@ -131,7 +131,9 @@ public final class WatchdogMode {
                 // Dev fallback: re-exec the same JAR via java
                 Path jar = Paths.get(WatchdogMode.class.getProtectionDomain()
                         .getCodeSource().getLocation().toURI());
-                String javaBin = Paths.get(System.getProperty("java.home"), "bin", "java.exe")
+                boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+                String javaExe = isWindows ? "java.exe" : "java";
+                String javaBin = Paths.get(System.getProperty("java.home"), "bin", javaExe)
                         .toString();
                 pb = new ProcessBuilder(javaBin, "-jar", jar.toString(), "--no-watchdog");
                 log.info("Dev mode: spawning child via {} -jar {} --no-watchdog",
@@ -154,8 +156,10 @@ public final class WatchdogMode {
                     .getCodeSource().getLocation().toURI());
             Path dir = jar.getParent();
             // Walk up looking for ActivePulse.exe (jpackage layout)
+            String os = System.getProperty("os.name", "").toLowerCase();
+            String launcherName = os.contains("win") ? "ActivePulse.exe" : "ActivePulse";
             for (int i = 0; dir != null && i < 4; i++) {
-                Path candidate = dir.resolve("ActivePulse.exe");
+                Path candidate = dir.resolve(launcherName);
                 if (Files.isRegularFile(candidate)) {
                     log.info("Resolved launcher: {}", candidate);
                     return candidate.toString();
