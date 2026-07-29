@@ -1,6 +1,7 @@
 package com.activepulse.agent.sync;
 
 import com.activepulse.agent.db.DatabaseManager;
+import com.activepulse.agent.diagnostics.DiagnosticsUploader;
 import com.activepulse.agent.monitor.AppConfigManager;
 import com.activepulse.agent.util.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -126,6 +127,7 @@ public final class SyncManager {
         strokeIds   = null;
 
         // 2. Screenshots
+        boolean screenshotSuccess = true;
         if (dataSyncSuccess) {
             List<Long>   screenshotIds   = new ArrayList<>();
             List<String> screenshotPaths = new ArrayList<>();
@@ -136,6 +138,7 @@ public final class SyncManager {
                     Path zipFile = buildZip(screenshotPaths, syncId);
                     if (zipFile != null) {
                         boolean ok = uploadScreenshots(zipFile, syncId, screenshotPaths);
+                        screenshotSuccess = ok;
                         if (ok) {
                             markSynced(conn, "screenshots", screenshotIds);
                             log.info("  Screenshot sync completed successfully.");
@@ -153,6 +156,16 @@ public final class SyncManager {
         }
 
         recordSyncLog(conn, syncId, syncStart, TimeUtil.nowIST());
+
+        // Rule A: tell diagnostics whether this cycle was fully healthy.
+        // Healthy (all 200) -> no error-log upload + reset dedup memory.
+        // Unhealthy -> trigger an error-log upload.
+        try {
+            DiagnosticsUploader.getInstance()
+                    .recordCycleHealth(dataSyncSuccess && screenshotSuccess);
+        } catch (Throwable t) {
+            log.debug("recordCycleHealth failed: {}", t.getMessage());
+        }
         log.info(SEP);
     }
 

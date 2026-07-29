@@ -98,6 +98,15 @@ public final class DiagnosticsUploader {
     private final Set<String>         syncedDates       = new HashSet<>();  // complete days done
     private final Map<String, String> shutdownSyncedAt  = new HashMap<>();  // date -> ISO timestamp
 
+    // Rule A: was the last sync cycle fully healthy (all 200)?
+    private volatile boolean lastCycleHealthy = true;
+    // Rule A: does an error-log upload need to run because a cycle failed?
+    private volatile boolean uploadPending = false;
+    // Rule C: fingerprints of errors already uploaded (dedup). Cleared on a
+    // healthy cycle so a recurrence after recovery is reported fresh.
+    private final java.util.Set<String> sentFingerprints =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     private DiagnosticsUploader() {
         this.stateFile     = PathResolver.dataDir().resolve("diagnostics-state.properties");
         this.heartbeatFile = PathResolver.dataDir().resolve("last-heartbeat.txt");
@@ -222,6 +231,27 @@ public final class DiagnosticsUploader {
     // ═════════════════════════════════════════════════════════════════
 
     /**
+     * Called by SyncManager after every cycle.
+     * healthy = data AND screenshots both returned 200.
+     *  - healthy   -> clear dedup memory (problem resolved); no upload.
+     *  - unhealthy -> flag that an error-log upload should run.
+     */
+    public void recordCycleHealth(boolean healthy) {
+        this.lastCycleHealthy = healthy;
+        if (healthy) {
+            if (!sentFingerprints.isEmpty()) {
+                log.info("Sync healthy again - clearing {} tracked error fingerprint(s)",
+                        sentFingerprints.size());
+                sentFingerprints.clear();
+                saveState();
+            }
+            uploadPending = false;
+        } else {
+            uploadPending = true;
+            log.info("Sync cycle unhealthy - error-log upload pending");
+        }
+    }
+    /**
      * Upload one day's log. For "today", uses time-slicing (new bytes only).
      * For older days, uploads the full file once and marks synced.
      *
@@ -270,10 +300,10 @@ public final class DiagnosticsUploader {
 
                 if (warnErrorOnly()) {
                     slice = filterWarnError(slice);
+                    // Rule C: drop errors already uploaded (same error -> skip).
+                    slice = dedupNewErrors(slice);
                     if (slice.length == 0) {
-                        // No WARN/ERROR in the new bytes — advance the offset so we
-                        // don't re-scan them, but send nothing.
-                        log.info("Warn/error-only: no WARN/ERROR in new bytes for {} "
+                        log.info("Warn/error-only: no NEW WARN/ERROR for {} "
                                 + "- advancing offset, nothing to upload", dateKey);
                         lastOffsets.put(dateKey, currentSize);
                         saveState();
@@ -303,6 +333,7 @@ public final class DiagnosticsUploader {
                 Path zipFile;
                 if (warnErrorOnly()) {
                     byte[] filtered = filterWarnError(Files.readAllBytes(logFile));
+                    filtered = dedupNewErrors(filtered);   // Rule C
                     if (filtered.length == 0) {
                         // No errors that whole day — mark done, upload nothing.
                         log.info("Warn/error-only: no WARN/ERROR for {} "
@@ -384,6 +415,54 @@ public final class DiagnosticsUploader {
     private static final java.util.regex.Pattern LOG_ENTRY_START =
             java.util.regex.Pattern.compile(
                     "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3} \\[.*?\\] (\\w+)\\b");
+
+    /** Fingerprint an error block: logger + message with volatile parts stripped
+     *  (timestamps, numbers, hex ids, GUIDs, file paths) so the same logical
+     *  error maps to the same signature across occurrences. */
+    private String fingerprint(String errorBlock) {
+        if (errorBlock == null) return "";
+        String first = errorBlock.split("\\R", 2)[0]; // first line = the error msg
+        String norm = first
+                .replaceAll("\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}[.,]?\\d*", " ") // timestamps
+                .replaceAll("\\[[^\\]]*\\]", " ")            // [thread] tokens
+                .replaceAll("0x[0-9a-fA-F]+", " ")           // hex
+                .replaceAll("\\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}\\b", " ") // GUIDs
+                .replaceAll("[A-Za-z]:\\\\[^\\s]+", " ")     // windows paths
+                .replaceAll("/[^\\s]+", " ")                 // unix paths
+                .replaceAll("\\d+", "#")                     // any remaining numbers
+                .replaceAll("\\s+", " ")
+                .trim().toLowerCase();
+        return Integer.toHexString(norm.hashCode());
+    }
+
+    /** Keep only error blocks whose fingerprint hasn't been sent yet (Rule C).
+     *  Returns the filtered bytes, or empty if every error was already sent. */
+    private byte[] dedupNewErrors(byte[] errorBytes) {
+        if (errorBytes == null || errorBytes.length == 0) return errorBytes;
+        String text = new String(errorBytes, java.nio.charset.StandardCharsets.UTF_8);
+        StringBuilder kept = new StringBuilder(text.length());
+        // Split into blocks: a new block starts at each timestamped line.
+        String[] lines = text.split("\\R", -1);
+        StringBuilder block = new StringBuilder();
+        java.util.function.Consumer<StringBuilder> flush = b -> {
+            if (b.length() == 0) return;
+            String fp = fingerprint(b.toString());
+            if (!fp.isEmpty() && sentFingerprints.add(fp)) {   // add() true = new
+                kept.append(b);
+            }
+        };
+        java.util.regex.Pattern start = java.util.regex.Pattern.compile(
+                "^\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}");
+        for (String line : lines) {
+            if (start.matcher(line).find() && block.length() > 0) {
+                flush.accept(block);
+                block.setLength(0);
+            }
+            block.append(line).append('\n');
+        }
+        flush.accept(block);
+        return kept.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
 
     /**
      * Keeps only WARN/ERROR entries and their continuation lines (stack traces,
@@ -731,6 +810,15 @@ public final class DiagnosticsUploader {
                     }
                 }
             }
+
+            // Rule C: restore previously-sent error fingerprints (no date prefix,
+            // so read it outside the dated-key loop above).
+            String fps = p.getProperty("sentFingerprints", "");
+            if (!fps.isBlank()) {
+                for (String f : fps.split(",")) {
+                    if (!f.isBlank()) sentFingerprints.add(f.trim());
+                }
+            }
         } catch (Exception e) {
             log.warn("Failed to load diagnostics state: {}", e.getMessage());
         }
@@ -749,6 +837,10 @@ public final class DiagnosticsUploader {
             for (var entry : shutdownSyncedAt.entrySet()) {
                 p.setProperty("shutdownSyncedAt." + entry.getKey(), entry.getValue());
             }
+
+            // Rule C: persist sent-error fingerprints (single comma-joined line).
+            p.setProperty("sentFingerprints", String.join(",", sentFingerprints));
+
             try (var out = Files.newOutputStream(stateFile)) {
                 p.store(out, "ActivePulse diagnostics upload state");
             }
