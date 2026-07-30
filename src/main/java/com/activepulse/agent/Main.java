@@ -59,9 +59,8 @@ public final class Main {
     private static final CountDownLatch SHUTDOWN = new CountDownLatch(1);
 
     public static void main(String[] args) {
-        System.setProperty("activepulse.logs.dir", resolveLogsDirEarly().toString());
-        System.out.println("LOGDIR PROP AT ENTRY = " + System.getProperty("activepulse.logs.dir"));
         System.out.println("AGENT MODE = " + com.activepulse.agent.util.AgentMode.isTest());
+        System.out.println("OS = " + System.getProperty("os.name"));
         // ═══════════════════════════════════════════════════════════════
         // STEP 0: SKIP-USER GUARD — must run BEFORE any I/O.
         // If the current user is admin/system, exit silently. No folders,
@@ -88,11 +87,18 @@ public final class Main {
             }
         }
 
-        // --no-watchdog ALWAYS wins. This is how the watchdog tells its
-        // spawned child "you are the agent, don't try to be a watchdog."
-        if (watchdogFlag && !noWatchdog) {
+        // macOS: never run the watchdog. launchd handles supervision, and the
+        // Mac app-bundle's java path differs — WatchdogMode's child-spawn fails
+        // on Mac (error=2, No such file or directory). Always run agent directly.
+        boolean isMac = System.getProperty("os.name", "").toLowerCase().contains("mac");
+
+        // --no-watchdog ALWAYS wins. On Mac, always run as the agent directly.
+        if (watchdogFlag && !noWatchdog && !isMac) {
             WatchdogMode.run();
             return;
+        }
+        if (watchdogFlag && isMac) {
+            System.out.println("macOS detected - ignoring --watchdog, running agent directly");
         }
 
         // ═══════════════════════════════════════════════════════════════
