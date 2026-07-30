@@ -3,7 +3,6 @@ package com.activepulse.agent;
 import com.activepulse.agent.autostart.AutostartFactory;
 import com.activepulse.agent.autostart.AutostartManager;
 import com.activepulse.agent.db.DatabaseManager;
-import com.activepulse.agent.diagnostics.DiagnosticsFallbackJob;
 import com.activepulse.agent.diagnostics.DiagnosticsUploader;
 import com.activepulse.agent.job.JobScheduler;
 import com.activepulse.agent.monitor.ActivitySessionManager;
@@ -182,18 +181,7 @@ public final class Main {
             scheduler.start();
 
             // ═══════════════════════════════════════════════════════════
-            // Step 9: Schedule diagnostics 12 PM fallback via Quartz.
-            // Fires uploadDailyFallback() every day at 12:00:00 IST.
-            // Skips if shutdown handler already synced today.
-            // ═══════════════════════════════════════════════════════════
-            try {
-                scheduleDiagnosticsFallback(scheduler);
-            } catch (Throwable t) {
-                log.warn("Failed to schedule diagnostics fallback: {}", t.getMessage());
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Step 10: Diagnostics heartbeat + unclean-shutdown catch-up.
+            // Step 9: Diagnostics heartbeat + unclean-shutdown catch-up.
             // Async to keep boot fast. checkPreviousShutdown:
             //   - Reads last-heartbeat.txt
             //   - If stale (> 5 min old) → previous session died uncleanly
@@ -283,29 +271,6 @@ public final class Main {
      *
      * where 'scheduler' is the internal Quartz field name.
      */
-    private static void scheduleDiagnosticsFallback(JobScheduler jobScheduler) throws Exception {
-        Scheduler quartz = jobScheduler.getQuartzScheduler();
-        if (quartz == null) {
-            log.warn("Quartz scheduler unavailable — diagnostics fallback not scheduled");
-            return;
-        }
-
-        String cronExpr = EnvConfig.get("DIAGNOSTICS_UPLOAD_CRON", "0 0 12 * * ?");
-
-        JobDetail job = JobBuilder.newJob(DiagnosticsFallbackJob.class)
-                .withIdentity("diagnostics.fallback", "diagnostics")
-                .build();
-
-        Trigger trigger = TriggerBuilder.newTrigger()
-                .withIdentity("diagnostics.fallback.trigger", "diagnostics")
-                .withSchedule(CronScheduleBuilder.cronSchedule(cronExpr)
-                        .inTimeZone(TimeZone.getTimeZone("Asia/Kolkata"))
-                        .withMisfireHandlingInstructionFireAndProceed())
-                .build();
-
-        quartz.scheduleJob(job, trigger);
-        log.info("Scheduled diagnostics fallback job with cron: {} (Asia/Kolkata)", cronExpr);
-    }
 
     /**
      * Resolve the per-user logs directory without using any logger.

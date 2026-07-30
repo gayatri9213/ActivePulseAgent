@@ -245,10 +245,21 @@ public final class DiagnosticsUploader {
                 sentFingerprints.clear();
                 saveState();
             }
-            uploadPending = false;
         } else {
-            uploadPending = true;
-            log.info("Sync cycle unhealthy - error-log upload pending");
+            // Error/failure occurred -> this is the ONLY trigger for a log upload.
+            log.info("Sync cycle failed - triggering error-log upload");
+            uploadErrorLogs();
+        }
+    }
+
+    /** The ONLY upload trigger: called when a sync cycle fails.
+     *  Uploads today's new error content (filtered + deduped). No schedule. */
+    public void uploadErrorLogs() {
+        if (!EnvConfig.getBool("DIAGNOSTICS_ENABLED", true)) return;
+        try {
+            uploadDay(LocalDate.now(), "error-triggered");
+        } catch (Throwable t) {
+            log.warn("uploadErrorLogs failed: {}", t.getMessage());
         }
     }
     /**
@@ -478,7 +489,8 @@ public final class DiagnosticsUploader {
             java.util.regex.Matcher m = LOG_ENTRY_START.matcher(line);
             if (m.find()) {
                 String level = m.group(1).toUpperCase();
-                keep = level.equals("WARN") || level.equals("ERROR");
+//                keep = level.equals("WARN") || level.equals("ERROR");
+                keep =  level.equals("ERROR");
             }
             // else: continuation line -> keep/drop with the current entry
             if (keep) out.append(line).append('\n');
