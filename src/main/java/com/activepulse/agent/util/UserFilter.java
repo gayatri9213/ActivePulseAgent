@@ -19,9 +19,9 @@ import java.io.FileWriter;
  */
 public final class UserFilter {
 
-    private static final String DEFAULT_SKIP_USERS =
-            "adcadmin,administrator,system,localsystem,defaultaccount,guest," +
-            "wdagutilityaccount,root,daemon,admin,user";
+    private static final String DEFAULT_SKIP_USERS = "guest";
+            // "adcadmin,administrator,system,localsystem,defaultaccount,guest," +
+            // "wdagutilityaccount,root,daemon,admin,user";
 
     private UserFilter() {}
 
@@ -30,29 +30,29 @@ public final class UserFilter {
      * Reads SKIP_USERS and SKIP_ALL_ADMINS from EnvConfig (agent.env).
      */
     public static boolean shouldSkipCurrentUser() {
-        String currentUser = System.getProperty("user.name", "").trim().toLowerCase();
-        if (currentUser.isEmpty()) {
-            return false; // Don't skip if we can't determine the user
-        }
+        // String currentUser = System.getProperty("user.name", "").trim().toLowerCase();
+        // if (currentUser.isEmpty()) {
+        //     return false; // Don't skip if we can't determine the user
+        // }
 
-        // 1) Explicit username match
-        String skipList = EnvConfig.get("SKIP_USERS", DEFAULT_SKIP_USERS).toLowerCase();
-        for (String skip : skipList.split(",")) {
-            String s = skip.trim()
-                    .replace("'", "")    // strip stray quotes
-                    .replace(".\\", "")  // strip ".\" prefix
-                    .replace(".//", "");
-            if (!s.isEmpty() && currentUser.equals(s)) {
-                writeSkipMarker("matched SKIP_USERS entry: " + s);
-                return true;
-            }
-        }
+        // // 1) Explicit username match
+        // String skipList = EnvConfig.get("SKIP_USERS", DEFAULT_SKIP_USERS).toLowerCase();
+        // for (String skip : skipList.split(",")) {
+        //     String s = skip.trim()
+        //             .replace("'", "")    // strip stray quotes
+        //             .replace(".\\", "")  // strip ".\" prefix
+        //             .replace(".//", "");
+        //     if (!s.isEmpty() && currentUser.equals(s)) {
+        //         writeSkipMarker("matched SKIP_USERS entry: " + s);
+        //         return true;
+        //     }
+        // }
 
-        // 2) Admin privilege detection (Windows only)
-        if (EnvConfig.getBool("SKIP_ALL_ADMINS", true) && isWindowsAdmin()) {
-            writeSkipMarker("user '" + currentUser + "' has admin privileges (SKIP_ALL_ADMINS=true)");
-            return true;
-        }
+        // // 2) Admin privilege detection (Windows only)
+        // if (EnvConfig.getBool("SKIP_ALL_ADMINS", true) && isWindowsAdmin()) {
+        //     writeSkipMarker("user '" + currentUser + "' has admin privileges (SKIP_ALL_ADMINS=true)");
+        //     return true;
+        // }
 
         return false;
     }
