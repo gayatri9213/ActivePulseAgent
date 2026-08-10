@@ -72,34 +72,34 @@ public final class Main {
             return;
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // STEP 1: MODE DISPATCH
-        // --no-watchdog: spawned child from watchdog, run as agent
-        // --watchdog:    main launcher invocation, become watchdog
-        // (neither):     manual launch, run as agent
-        // ═══════════════════════════════════════════════════════════════
-        boolean noWatchdog = false;
-        boolean watchdogFlag = false;
-        if (args != null) {
-            for (String arg : args) {
-                if ("--no-watchdog".equalsIgnoreCase(arg)) noWatchdog = true;
-                if ("--watchdog".equalsIgnoreCase(arg))    watchdogFlag = true;
-            }
-        }
-
-        // macOS: never run the watchdog. launchd handles supervision, and the
-        // Mac app-bundle's java path differs — WatchdogMode's child-spawn fails
-        // on Mac (error=2, No such file or directory). Always run agent directly.
-        boolean isMac = System.getProperty("os.name", "").toLowerCase().contains("mac");
-
-        // --no-watchdog ALWAYS wins. On Mac, always run as the agent directly.
-        if (watchdogFlag && !noWatchdog && !isMac) {
-            WatchdogMode.run();
-            return;
-        }
-        if (watchdogFlag && isMac) {
-            System.out.println("macOS detected - ignoring --watchdog, running agent directly");
-        }
+//        // ═══════════════════════════════════════════════════════════════
+//        // STEP 1: MODE DISPATCH
+//        // --no-watchdog: spawned child from watchdog, run as agent
+//        // --watchdog:    main launcher invocation, become watchdog
+//        // (neither):     manual launch, run as agent
+//        // ═══════════════════════════════════════════════════════════════
+//        boolean noWatchdog = false;
+//        boolean watchdogFlag = false;
+//        if (args != null) {
+//            for (String arg : args) {
+//                if ("--no-watchdog".equalsIgnoreCase(arg)) noWatchdog = true;
+//                if ("--watchdog".equalsIgnoreCase(arg))    watchdogFlag = true;
+//            }
+//        }
+//
+//        // macOS: never run the watchdog. launchd handles supervision, and the
+//        // Mac app-bundle's java path differs — WatchdogMode's child-spawn fails
+//        // on Mac (error=2, No such file or directory). Always run agent directly.
+//        boolean isMac = System.getProperty("os.name", "").toLowerCase().contains("mac");
+//
+//        // --no-watchdog ALWAYS wins. On Mac, always run as the agent directly.
+//        if (watchdogFlag && !noWatchdog && !isMac) {
+//            WatchdogMode.run();
+//            return;
+//        }
+//        if (watchdogFlag && isMac) {
+//            System.out.println("macOS detected - ignoring --watchdog, running agent directly");
+//        }
 
         // ═══════════════════════════════════════════════════════════════
         // Set log directory BEFORE any logger is initialized.

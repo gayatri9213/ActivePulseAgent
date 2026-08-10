@@ -56,7 +56,7 @@ public final class ActivitySessionManager {
     private long             sessionStartTotalInputs;
 
     private static final int  FAST_IDLE_THRESHOLD_SEC      = 300;
-    private static final long YOUTUBE_IDLE_THRESHOLD_SEC   = 3600; //3600
+    private static final long YOUTUBE_IDLE_THRESHOLD_SEC   = 1800; //3600
     private static final long BROWSER_NO_URL_THRESHOLD_SEC = 1800; //1800
 
     /**

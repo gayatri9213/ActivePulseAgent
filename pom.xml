@@ -6,14 +6,14 @@
 
     <groupId>com.activepulse</groupId>
     <artifactId>activepulse-agent</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.0</version>
     <packaging>jar</packaging>
 
     <name>ActivePulse Agent</name>
     <description>Cross-platform background activity monitoring agent for AD-managed environments</description>
 
     <properties>
-        <java.version>17</java.version>
+        <java.version>25</java.version>
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -107,6 +107,8 @@
             <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
+
+
     </dependencies>
 
     <build>

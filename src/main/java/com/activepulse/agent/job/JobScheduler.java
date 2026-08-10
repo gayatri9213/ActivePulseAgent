@@ -68,7 +68,7 @@ public final class JobScheduler {
         }
 
         if (EnvConfig.getBool("ENABLE_SCREENSHOTS", true)) {
-            int sec = EnvConfig.getInt("SCREENSHOT_INTERVAL_SECONDS", 300);
+            int sec = EnvConfig.getInt("SCREENSHOT_INTERVAL_SECONDS", 900);
             JobDetail job = newJob(ScreenshotJob.class)
                     .withIdentity("screenshotJob", "capture")
                     .build();
