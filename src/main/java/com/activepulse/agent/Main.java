@@ -110,6 +110,21 @@ public final class Main {
         Path logsDir = resolveLogsDirEarly();
         System.setProperty("activepulse.logs.dir", logsDir.toString());
 
+        // Linux/macOS ONLY fix: Logback actually auto-initializes the moment
+        // any static Logger field's class is loaded (e.g. EnvConfig's, or
+        // this very class's), which happens BEFORE this line runs — so by
+        // now Logback has already bound to logback.xml's fallback path
+        // "${LOCALAPPDATA:-${user.home}/AppData/Local}/ActivePulse/logs".
+        // On Windows that fallback coincidentally equals the real target
+        // (LOCALAPPDATA is always set), so Windows is left untouched here.
+        // On Linux/macOS, LOCALAPPDATA is unset, so logs were silently
+        // written under "<home>/AppData/Local/ActivePulse/logs" instead of
+        // the documented per-OS logs dir. Force Logback to rebind now that
+        // activepulse.logs.dir is set, so logs land in the expected place.
+        if (!System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            reinitLogback();
+        }
+
         // NOW safe to initialize loggers
         log.info("ActivePulse 1.0.0 starting...");
 //
