@@ -6,6 +6,8 @@ import oshi.SystemInfo;
 import oshi.hardware.ComputerSystem;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 public final class DeviceIdProvider {
     private static final Logger log = LoggerFactory.getLogger(DeviceIdProvider.class);
@@ -49,6 +51,21 @@ public final class DeviceIdProvider {
                         "Mac Serial Number unavailable. Trying Hardware UUID...");
             }
 
+            if (osName.contains("linux")) {
+    String machineId = getLinuxMachineId();
+
+    if (isValid(machineId)) {
+        log.info(
+                "Using Linux machine-id as deviceId: {}",
+                machineId);
+
+        return "DEV-" +
+                machineId.trim().toUpperCase();
+    }
+
+    log.warn(
+            "Linux machine-id unavailable. Trying Hardware UUID...");
+}
             /*
              * Hardware UUID for all platforms
              */
@@ -83,6 +100,31 @@ public final class DeviceIdProvider {
         throw new RuntimeException(
                 "Unable to determine a stable device ID for this machine.");
     }
+
+    private static String getLinuxMachineId() {
+
+    try {
+
+        Path path = Path.of("/etc/machine-id");
+
+        if (Files.exists(path)) {
+
+            String machineId = Files.readString(path).trim();
+
+            if (isValid(machineId)) {
+                return machineId;
+            }
+        }
+
+    } catch (Exception e) {
+
+        log.warn(
+                "Failed to fetch Linux machine-id: {}",
+                e.getMessage());
+    }
+
+    return null;
+}
 
     private static String getMacSerialNumber() {
 
