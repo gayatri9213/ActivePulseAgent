@@ -10,6 +10,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.URI;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -17,6 +18,7 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -24,89 +26,142 @@ import java.util.stream.Stream;
  * Builds the nested `location` block sent in each sync payload.
  *
  * WFH/WFO strategy:
- *  1. Always collect private IP.
- *  2. Always collect public IP.
- *  3. If private IP belongs to a configured office subnet -> WFO.
- *  4. Else if public IP matches a configured office public IP -> WFO.
- *  5. Else -> WFH_NETWORK.
+ *
+ * 1. Collect private IP.
+ * 2. Collect public IP.
+ * 3. If private IP belongs to configured office subnet -> WFO.
+ * 4. Else if public IP matches configured office public IP -> WFO.
+ * 5. Else if configured office SSID matches -> WFO.
+ * 6. Else -> WFH.
+ *
+ * WFH location:
+ *
+ * 1. Windows Location script is executed.
+ * 2. Latitude, longitude and accuracy are collected.
+ * 3. Coordinates are reverse-geocoded using Nominatim.
+ * 4. City/state/country/postcode/address are populated.
  *
  * Important:
- *  - Existing location payload structure is unchanged.
- *  - WFH does NOT use approximate GPS/IP coordinates.
- *  - Google Geolocation, Windows Location and IP geolocation are deliberately
- *    not used for WFH/WFO classification.
- *  - Office coordinates are authoritative configured office coordinates,
- *    not user/device coordinates.
+ * - Network detection remains authoritative for WFH/WFO.
+ * - WFH coordinates are only location enrichment.
+ * - Poor/unavailable location does NOT change WFH to WFO.
  */
 public final class MachineInfo {
 
-    private static final Logger log = LoggerFactory.getLogger(MachineInfo.class);
+    private static final Logger log =
+            LoggerFactory.getLogger(MachineInfo.class);
 
     private static final int HTTP_TIMEOUT_MS = 5_000;
-    private static final Duration CACHE_TTL = Duration.ofMinutes(5);
+
+    /**
+     * Existing payload cache.
+     */
+    private static final Duration CACHE_TTL =
+            Duration.ofMinutes(5);
+
+    /**
+     * WFH location is refreshed once per hour by default.
+     *
+     * This prevents Nominatim from being called on every
+     * 5-minute ActivePulse sync.
+     */
+    private static final Duration WFH_LOCATION_CACHE_TTL =
+            Duration.ofHours(1);
 
     private static volatile Map<String, Object> cachedLocation;
     private static volatile Instant cachedAt;
 
+    private static volatile Map<String, Object> cachedWfhLocation;
+    private static volatile Instant cachedWfhLocationAt;
+
     private MachineInfo() {
     }
 
+    // -----------------------------------------------------------------
+    // PUBLIC LOCATION PAYLOAD
+    // -----------------------------------------------------------------
+
     public static Map<String, Object> getLocationPayload() {
+
         Instant now = Instant.now();
 
         if (cachedLocation != null && cachedAt != null) {
-            Duration age = Duration.between(cachedAt, now);
+
+            Duration age =
+                    Duration.between(cachedAt, now);
+
             if (age.compareTo(CACHE_TTL) < 0) {
                 return cachedLocation;
             }
         }
 
-        Map<String, Object> result = buildLocationPayload();
+        Map<String, Object> result =
+                buildLocationPayload();
+
         cachedLocation = result;
         cachedAt = now;
+
         return result;
     }
 
+    /**
+     * Deprecated compatibility method.
+     */
     @Deprecated
     public static Map<String, Object> getSyncDetails() {
-        Map<String, Object> loc = getLocationPayload();
 
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("privateIp", loc.get("privateIp"));
-        out.put("publicIp", loc.get("publicIp"));
-        out.put("locationDetails",
+        Map<String, Object> loc =
+                getLocationPayload();
+
+        Map<String, Object> out =
+                new LinkedHashMap<>();
+
+        out.put(
+                "privateIp",
+                loc.get("privateIp"));
+
+        out.put(
+                "publicIp",
+                loc.get("publicIp"));
+
+        out.put(
+                "locationDetails",
                 Stream.of(
                                 loc.get("city"),
                                 loc.get("region"),
                                 loc.get("country"))
-                        .filter(value -> value != null && !String.valueOf(value).isBlank())
+                        .filter(value ->
+                                value != null
+                                        && !String.valueOf(value).isBlank())
                         .map(String::valueOf)
                         .collect(Collectors.joining(", ")));
+
         return out;
     }
 
-    /**
-     * Creates the location payload.
-     *
-     * WFO:
-     *   - private IP matches an office subnet OR
-     *   - public IP matches an office public IP
-     *
-     * WFH:
-     *   - neither office signal matches
-     *
-     * WFH latitude/longitude are intentionally null.
-     */
+    // -----------------------------------------------------------------
+    // BUILD LOCATION
+    // -----------------------------------------------------------------
+
     private static Map<String, Object> buildLocationPayload() {
 
-        Map<String, Object> result = new LinkedHashMap<>();
+        Map<String, Object> result =
+                new LinkedHashMap<>();
 
-        String privateIp = getPrivateIp();
-        String publicIp = getPublicIp();
+        String privateIp =
+                getPrivateIp();
 
+        String publicIp =
+                getPublicIp();
+
+        /*
+         * Default values.
+         */
         result.put("address", null);
         result.put("latitude", null);
         result.put("longitude", null);
+        result.put("accuracy", null);
+
         result.put("city", null);
         result.put("region", null);
         result.put("country", null);
@@ -115,16 +170,24 @@ public final class MachineInfo {
         result.put("publicIp", publicIp);
         result.put("privateIp", privateIp);
 
-        result.put("locationSource", "UNKNOWN");
+        result.put(
+                "locationSource",
+                "UNKNOWN");
 
         // -------------------------------------------------------------
         // 1. PRIVATE OFFICE NETWORK
         // -------------------------------------------------------------
-        if (applyOfficeOverride(result)) {
-            result.put("locationSource", "OFFICE_PRIVATE_SUBNET");
 
-            log.info("Office detected from private subnet. privateIp={}, publicIp={}",
-                    privateIp, publicIp);
+        if (applyOfficeOverride(result)) {
+
+            result.put(
+                    "locationSource",
+                    "OFFICE_PRIVATE_SUBNET");
+
+            log.info(
+                    "Office detected from private subnet. privateIp={}, publicIp={}",
+                    privateIp,
+                    publicIp);
 
             return result;
         }
@@ -132,61 +195,626 @@ public final class MachineInfo {
         // -------------------------------------------------------------
         // 2. PUBLIC OFFICE IP
         // -------------------------------------------------------------
-        if (applyPublicIpOfficeOverride(result, publicIp)) {
-            result.put("locationSource", "OFFICE_PUBLIC_IP");
 
-            log.info("Office detected from public IP. publicIp={}, privateIp={}",
-                    publicIp, privateIp);
+        if (applyPublicIpOfficeOverride(
+                result,
+                publicIp)) {
+
+            result.put(
+                    "locationSource",
+                    "OFFICE_PUBLIC_IP");
+
+            log.info(
+                    "Office detected from public IP. publicIp={}, privateIp={}",
+                    publicIp,
+                    privateIp);
 
             return result;
         }
 
         // -------------------------------------------------------------
-        // 3. OPTIONAL OFFICE SSID
-        //
-        // SSID is only used if explicitly configured. It is an additional
-        // exact office signal and does not use coordinates from the device.
+        // 3. OFFICE SSID
         // -------------------------------------------------------------
+
         if (matchesOfficeSsid(result)) {
-            result.put("locationSource", "OFFICE_SSID");
 
-            log.info("Office detected from configured SSID. publicIp={}, privateIp={}",
-                    publicIp, privateIp);
+            result.put(
+                    "locationSource",
+                    "OFFICE_SSID");
+
+            log.info(
+                    "Office detected from configured SSID. publicIp={}, privateIp={}",
+                    publicIp,
+                    privateIp);
 
             return result;
         }
 
         // -------------------------------------------------------------
-        // 4. NOT AN OFFICE NETWORK -> WFH
-        //
-        // No approximate coordinates are generated.
+        // 4. WFH
         // -------------------------------------------------------------
-        result.put("locationSource", "WFH_NETWORK");
 
-        log.info("WFH detected. publicIp={}, privateIp={}", publicIp, privateIp);
+        result.put(
+                "locationSource",
+                "WFH_NETWORK");
+
+        log.info(
+                "WFH detected. publicIp={}, privateIp={}",
+                publicIp,
+                privateIp);
+
+        /*
+         * WFH is already determined by network logic.
+         *
+         * Now only enrich the WFH payload with the actual
+         * Windows device location.
+         */
+        applyWfhLocation(result);
 
         return result;
+    }
+
+    // -----------------------------------------------------------------
+    // WFH LOCATION
+    // -----------------------------------------------------------------
+
+    /**
+     * Gets Windows device coordinates for a WFH machine.
+     *
+     * The location result is cached for one hour by default.
+     *
+     * WFH classification is NOT affected if location fails.
+     */
+    private static void applyWfhLocation(
+            Map<String, Object> result) {
+
+        if (!isWindows()) {
+
+            log.debug(
+                    "WFH location skipped because OS is not Windows.");
+
+            return;
+        }
+
+        Map<String, Object> location =
+                getWfhLocation();
+
+        if (location == null || location.isEmpty()) {
+
+            log.info(
+                    "Windows WFH location unavailable. "
+                            + "WFH classification remains unchanged.");
+
+            return;
+        }
+
+        result.put(
+                "latitude",
+                location.get("latitude"));
+
+        result.put(
+                "longitude",
+                location.get("longitude"));
+
+        result.put(
+                "accuracy",
+                location.get("accuracy"));
+
+        result.put(
+                "city",
+                location.get("city"));
+
+        result.put(
+                "region",
+                location.get("region"));
+
+        result.put(
+                "country",
+                location.get("country"));
+
+        result.put(
+                "zip",
+                location.get("zip"));
+
+        result.put(
+                "address",
+                location.get("address"));
+
+        result.put(
+                "locationSource",
+                location.getOrDefault(
+                        "locationSource",
+                        "WINDOWS_LOCATION"));
+
+        log.info(
+                "WFH location populated. city={}, lat={}, lng={}, accuracy={}m",
+                location.get("city"),
+                location.get("latitude"),
+                location.get("longitude"),
+                location.get("accuracy"));
+    }
+
+    /**
+     * Gets and caches WFH location.
+     */
+    private static Map<String, Object> getWfhLocation() {
+
+        Instant now =
+                Instant.now();
+
+        if (cachedWfhLocation != null
+                && cachedWfhLocationAt != null) {
+
+            Duration age =
+                    Duration.between(
+                            cachedWfhLocationAt,
+                            now);
+
+            if (age.compareTo(
+                    WFH_LOCATION_CACHE_TTL) < 0) {
+
+                return cachedWfhLocation;
+            }
+        }
+
+        Map<String, Object> location =
+                executeWindowsLocationScript();
+
+        if (location == null
+                || location.isEmpty()) {
+
+            return Collections.emptyMap();
+        }
+
+        /*
+         * Reverse geocode only when we have valid
+         * latitude and longitude.
+         */
+        Double latitude =
+                toDouble(
+                        location.get("latitude"));
+
+        Double longitude =
+                toDouble(
+                        location.get("longitude"));
+
+        if (latitude == null
+                || longitude == null) {
+
+            return location;
+        }
+
+        Map<String, Object> address =
+                reverseGeocode(
+                        latitude,
+                        longitude);
+
+        if (address != null) {
+
+            location.putAll(address);
+        }
+
+        location.put(
+                "locationSource",
+                "WINDOWS_LOCATION");
+
+        cachedWfhLocation =
+                location;
+
+        cachedWfhLocationAt =
+                now;
+
+        return location;
+    }
+
+    // -----------------------------------------------------------------
+    // WINDOWS LOCATION SCRIPT
+    // -----------------------------------------------------------------
+
+    /**
+     * Executes the Windows location .cmd file.
+     *
+     * Configure:
+     *
+     * WINDOWS_LOCATION_SCRIPT=C:\ActivePulse\get-location.cmd
+     *
+     * The script should output:
+     *
+     * Started: True
+     * Latitude: 18.5204303
+     * Longitude: 73.8567437
+     * Accuracy: 45 meters
+     */
+    private static Map<String, Object>
+    executeWindowsLocationScript() {
+
+        String scriptPath =
+                EnvConfig.get(
+                        "WINDOWS_LOCATION_SCRIPT",
+                        "");
+
+        if (scriptPath == null
+                || scriptPath.isBlank()) {
+
+            log.warn(
+                    "WINDOWS_LOCATION_SCRIPT is not configured.");
+
+            return Collections.emptyMap();
+        }
+
+        Process process = null;
+
+        try {
+
+            process =
+                    new ProcessBuilder(
+                            "cmd.exe",
+                            "/c",
+                            scriptPath)
+                            .redirectErrorStream(true)
+                            .start();
+
+            String output;
+
+            try (BufferedReader reader =
+                         new BufferedReader(
+                                 new InputStreamReader(
+                                         process.getInputStream(),
+                                         StandardCharsets.UTF_8))) {
+
+                output =
+                        reader.lines()
+                                .collect(
+                                        Collectors.joining("\n"));
+            }
+
+            boolean finished =
+                    process.waitFor(
+                            45,
+                            TimeUnit.SECONDS);
+
+            if (!finished) {
+
+                process.destroyForcibly();
+
+                log.warn(
+                        "Windows location script timed out.");
+
+                return Collections.emptyMap();
+            }
+
+            log.debug(
+                    "Windows location script output:\n{}",
+                    output);
+
+            return parseWindowsLocationOutput(
+                    output);
+
+        } catch (Exception e) {
+
+            log.warn(
+                    "Windows location script failed: {}",
+                    e.getMessage());
+
+            return Collections.emptyMap();
+
+        } finally {
+
+            if (process != null
+                    && process.isAlive()) {
+
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    /**
+     * Parses output from get-location.cmd.
+     */
+    private static Map<String, Object>
+    parseWindowsLocationOutput(
+            String output) {
+
+        if (output == null
+                || output.isBlank()) {
+
+            return Collections.emptyMap();
+        }
+
+        if (output.contains(
+                "LOCATION_UNAVAILABLE")) {
+
+            log.info(
+                    "Windows location returned LOCATION_UNAVAILABLE.");
+
+            return Collections.emptyMap();
+        }
+
+        Double latitude =
+                extractDouble(
+                        output,
+                        "Latitude:");
+
+        Double longitude =
+                extractDouble(
+                        output,
+                        "Longitude:");
+
+        Double accuracy =
+                extractDouble(
+                        output,
+                        "Accuracy:");
+
+        if (latitude == null
+                || longitude == null) {
+
+            log.info(
+                    "Windows location did not return valid coordinates.");
+
+            return Collections.emptyMap();
+        }
+
+        Map<String, Object> result =
+                new LinkedHashMap<>();
+
+        result.put(
+                "latitude",
+                latitude);
+
+        result.put(
+                "longitude",
+                longitude);
+
+        result.put(
+                "accuracy",
+                accuracy);
+
+        return result;
+    }
+
+    /**
+     * Extracts numeric value after a label.
+     *
+     * Example:
+     *
+     * Latitude: 18.5204303
+     * Accuracy: 45 meters
+     */
+    private static Double extractDouble(
+            String output,
+            String label) {
+
+        try {
+
+            return Stream.of(
+                            output.split("\\R"))
+                    .map(String::trim)
+                    .filter(line ->
+                            line.toLowerCase()
+                                    .startsWith(
+                                            label.toLowerCase()))
+                    .map(line ->
+                            line.substring(
+                                            label.length())
+                                    .trim())
+                    .map(value ->
+                            value.replaceAll(
+                                    "[^0-9+\\-.].*$",
+                                    ""))
+                    .filter(value ->
+                            !value.isBlank())
+                    .map(Double::parseDouble)
+                    .findFirst()
+                    .orElse(null);
+
+        } catch (Exception e) {
+
+            log.debug(
+                    "Unable to parse {}: {}",
+                    label,
+                    e.getMessage());
+
+            return null;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // NOMINATIM REVERSE GEOCODING
+    // -----------------------------------------------------------------
+
+    /**
+     * Reverse geocodes Windows coordinates.
+     *
+     * Example:
+     *
+     * https://nominatim.openstreetmap.org/reverse
+     * ?lat=18.5204
+     * &lon=73.8567
+     * &format=jsonv2
+     * &addressdetails=1
+     */
+    private static Map<String, Object>
+    reverseGeocode(
+            double latitude,
+            double longitude) {
+
+        try {
+
+            String url =
+                    "https://nominatim.openstreetmap.org/reverse"
+                            + "?lat="
+                            + URLEncoder.encode(
+                            String.valueOf(latitude),
+                            StandardCharsets.UTF_8)
+                            + "&lon="
+                            + URLEncoder.encode(
+                            String.valueOf(longitude),
+                            StandardCharsets.UTF_8)
+                            + "&format=jsonv2"
+                            + "&addressdetails=1";
+
+            String response =
+                    httpGet(
+                            url,
+                            "ActivePulse-Agent/1.0");
+
+            if (response == null
+                    || response.isBlank()) {
+
+                log.warn(
+                        "Nominatim reverse geocoding returned no response.");
+
+                return Collections.emptyMap();
+            }
+
+            String city =
+                    extractJsonString(
+                            response,
+                            "city");
+
+            /*
+             * Nominatim may return town/village instead
+             * of city.
+             */
+            if (city == null
+                    || city.isBlank()) {
+
+                city =
+                        extractJsonString(
+                                response,
+                                "town");
+            }
+
+            if (city == null
+                    || city.isBlank()) {
+
+                city =
+                        extractJsonString(
+                                response,
+                                "village");
+            }
+
+            String region =
+                    extractJsonString(
+                            response,
+                            "state");
+
+            String country =
+                    extractJsonString(
+                            response,
+                            "country");
+
+            String zip =
+                    extractJsonString(
+                            response,
+                            "postcode");
+
+            String address =
+                    extractJsonString(
+                            response,
+                            "display_name");
+
+            Map<String, Object> result =
+                    new LinkedHashMap<>();
+
+            result.put(
+                    "city",
+                    emptyToNull(city));
+
+            result.put(
+                    "region",
+                    emptyToNull(region));
+
+            result.put(
+                    "country",
+                    emptyToNull(country));
+
+            result.put(
+                    "zip",
+                    emptyToNull(zip));
+
+            result.put(
+                    "address",
+                    emptyToNull(address));
+
+            log.info(
+                    "WFH reverse geocoding result: city={}, region={}, country={}",
+                    city,
+                    region,
+                    country);
+
+            return result;
+
+        } catch (Exception e) {
+
+            log.warn(
+                    "WFH reverse geocoding failed: {}",
+                    e.getMessage());
+
+            return Collections.emptyMap();
+        }
+    }
+
+    /**
+     * Lightweight JSON string extraction.
+     *
+     * This avoids adding another JSON dependency to MachineInfo.
+     */
+    private static String extractJsonString(
+            String json,
+            String key) {
+
+        if (json == null
+                || key == null) {
+
+            return null;
+        }
+
+        try {
+
+            String pattern =
+                    "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"";
+
+            java.util.regex.Matcher matcher =
+                    java.util.regex.Pattern
+                            .compile(pattern)
+                            .matcher(json);
+
+            return matcher.find()
+                    ? matcher.group(1)
+                    : null;
+
+        } catch (Exception e) {
+
+            return null;
+        }
     }
 
     // -----------------------------------------------------------------
     // PUBLIC IP
     // -----------------------------------------------------------------
 
-    /**
-     * Gets the current public IPv4 address.
-     *
-     * HTTPS provider is used. If the lookup fails, the payload still goes
-     * forward with an empty publicIp; backend can use private subnet or mark
-     * the location as unknown according to its own policy.
-     */
     public static String getPublicIp() {
+
         try {
-            String ip = httpGet("https://api.ipify.org", "ActivePulse/1.0");
-            if (ip != null && !ip.isBlank() && isValidIpv4(ip.trim())) {
+
+            String ip =
+                    httpGet(
+                            "https://api.ipify.org",
+                            "ActivePulse/1.0");
+
+            if (ip != null
+                    && !ip.isBlank()
+                    && isValidIpv4(ip.trim())) {
+
                 return ip.trim();
             }
+
         } catch (Exception e) {
-            log.debug("getPublicIp failed: {}", e.getMessage());
+
+            log.debug(
+                    "getPublicIp failed: {}",
+                    e.getMessage());
         }
 
         return "";
@@ -196,47 +824,68 @@ public final class MachineInfo {
     // OFFICE PUBLIC IP
     // -----------------------------------------------------------------
 
-    private static boolean applyPublicIpOfficeOverride(
+    private static boolean
+    applyPublicIpOfficeOverride(
             Map<String, Object> result,
             String publicIp) {
 
-        if (publicIp == null || publicIp.isBlank()) {
+        if (publicIp == null
+                || publicIp.isBlank()) {
+
             return false;
         }
 
         String officePublicIps =
-                EnvConfig.get("OFFICE_PUBLIC_IPS", "").trim();
+                EnvConfig.get(
+                        "OFFICE_PUBLIC_IPS",
+                        "").trim();
 
         if (officePublicIps.isBlank()) {
+
             return false;
         }
 
-        boolean matched = Stream.of(officePublicIps.split(","))
-                .map(String::trim)
-                .filter(value -> !value.isBlank())
-                .anyMatch(publicIp::equals);
+        boolean matched =
+                Stream.of(
+                                officePublicIps.split(","))
+                        .map(String::trim)
+                        .filter(value ->
+                                !value.isBlank())
+                        .anyMatch(
+                                publicIp::equals);
 
         if (!matched) {
+
             return false;
         }
 
-        String city = EnvConfig.get(
-                "OFFICE_PUBLIC_IP_CITY",
-                "Pune").trim();
+        String city =
+                EnvConfig.get(
+                        "OFFICE_PUBLIC_IP_CITY",
+                        "Pune").trim();
 
-        String region = EnvConfig.get(
-                "OFFICE_PUBLIC_IP_REGION",
-                "Maharashtra").trim();
+        String region =
+                EnvConfig.get(
+                        "OFFICE_PUBLIC_IP_REGION",
+                        "Maharashtra").trim();
 
-        String country = EnvConfig.get(
-                "OFFICE_PUBLIC_IP_COUNTRY",
-                "India").trim();
+        String country =
+                EnvConfig.get(
+                        "OFFICE_PUBLIC_IP_COUNTRY",
+                        "India").trim();
 
         result.put("city", city);
         result.put("region", region);
         result.put("country", country);
-        result.put("address", buildAddress(city, region, country));
+        result.put(
+                "address",
+                buildAddress(
+                        city,
+                        region,
+                        country));
+
         result.put("zip", null);
+        result.put("accuracy", null);
 
         result.put(
                 "latitude",
@@ -250,7 +899,10 @@ public final class MachineInfo {
                         "OFFICE_PUBLIC_IP_LNG",
                         73.925595));
 
-        log.info("Office public IP match: {} -> {}", publicIp, city);
+        log.info(
+                "Office public IP match: {} -> {}",
+                publicIp,
+                city);
 
         return true;
     }
@@ -261,22 +913,23 @@ public final class MachineInfo {
 
     private static String getCurrentSsid() {
 
-        if (!System.getProperty("os.name", "")
-                .toLowerCase()
-                .contains("win")) {
+        if (!isWindows()) {
+
             return "";
         }
 
         Process process = null;
 
         try {
-            process = new ProcessBuilder(
-                    "netsh",
-                    "wlan",
-                    "show",
-                    "interfaces")
-                    .redirectErrorStream(true)
-                    .start();
+
+            process =
+                    new ProcessBuilder(
+                            "netsh",
+                            "wlan",
+                            "show",
+                            "interfaces")
+                            .redirectErrorStream(true)
+                            .start();
 
             try (BufferedReader reader =
                          new BufferedReader(
@@ -286,32 +939,49 @@ public final class MachineInfo {
 
                 String line;
 
-                while ((line = reader.readLine()) != null) {
+                while ((line =
+                        reader.readLine()) != null) {
 
-                    String trimmed = line.trim();
-                    int index = trimmed.indexOf(':');
+                    String trimmed =
+                            line.trim();
+
+                    int index =
+                            trimmed.indexOf(':');
 
                     if (index <= 0) {
                         continue;
                     }
 
-                    String key = trimmed.substring(0, index).trim();
+                    String key =
+                            trimmed.substring(
+                                            0,
+                                            index)
+                                    .trim();
 
                     if ("SSID".equalsIgnoreCase(key)) {
-                        return trimmed.substring(index + 1).trim();
+
+                        return trimmed.substring(
+                                        index + 1)
+                                .trim();
                     }
                 }
             }
 
             process.waitFor(
                     4,
-                    java.util.concurrent.TimeUnit.SECONDS);
+                    TimeUnit.SECONDS);
 
         } catch (Exception e) {
-            log.debug("getCurrentSsid failed: {}", e.getMessage());
+
+            log.debug(
+                    "getCurrentSsid failed: {}",
+                    e.getMessage());
 
         } finally {
-            if (process != null && process.isAlive()) {
+
+            if (process != null
+                    && process.isAlive()) {
+
                 process.destroyForcibly();
             }
         }
@@ -323,43 +993,65 @@ public final class MachineInfo {
             Map<String, Object> result) {
 
         String configuredSsids =
-                EnvConfig.get("OFFICE_SSIDS", "").trim();
+                EnvConfig.get(
+                        "OFFICE_SSIDS",
+                        "").trim();
 
         if (configuredSsids.isBlank()) {
+
             return false;
         }
 
-        String currentSsid = getCurrentSsid();
+        String currentSsid =
+                getCurrentSsid();
 
         if (currentSsid.isBlank()) {
+
             return false;
         }
 
-        boolean matched = Stream.of(configuredSsids.split(","))
-                .map(String::trim)
-                .filter(value -> !value.isBlank())
-                .anyMatch(currentSsid::equalsIgnoreCase);
+        boolean matched =
+                Stream.of(
+                                configuredSsids.split(","))
+                        .map(String::trim)
+                        .filter(value ->
+                                !value.isBlank())
+                        .anyMatch(
+                                currentSsid::equalsIgnoreCase);
 
         if (!matched) {
+
             return false;
         }
 
-        String city = EnvConfig.get(
-                "OFFICE_SSID_CITY",
-                "Pune").trim();
+        String city =
+                EnvConfig.get(
+                        "OFFICE_SSID_CITY",
+                        "Pune").trim();
 
-        String region = EnvConfig.get(
-                "OFFICE_SSID_REGION",
-                "Maharashtra").trim();
+        String region =
+                EnvConfig.get(
+                        "OFFICE_SSID_REGION",
+                        "Maharashtra").trim();
 
-        String country = EnvConfig.get(
-                "OFFICE_SSID_COUNTRY",
-                "India").trim();
+        String country =
+                EnvConfig.get(
+                        "OFFICE_SSID_COUNTRY",
+                        "India").trim();
 
         result.put("city", city);
         result.put("region", region);
         result.put("country", country);
-        result.put("address", buildAddress(city, region, country));
+
+        result.put(
+                "address",
+                buildAddress(
+                        city,
+                        region,
+                        country));
+
+        result.put("zip", null);
+        result.put("accuracy", null);
 
         result.put(
                 "latitude",
@@ -385,19 +1077,25 @@ public final class MachineInfo {
 
         String privateIp =
                 String.valueOf(
-                        result.getOrDefault("privateIp", ""));
+                        result.getOrDefault(
+                                "privateIp",
+                                ""));
 
         if (privateIp.isBlank()) {
+
             return false;
         }
 
         // PUNE
+
         String puneSubnets =
                 EnvConfig.get(
                         "OFFICE_PUNE_SUBNETS",
                         "192.168.30.0/24").trim();
 
-        if (matchesAnySubnet(privateIp, puneSubnets)) {
+        if (matchesAnySubnet(
+                privateIp,
+                puneSubnets)) {
 
             putOfficeLocation(
                     result,
@@ -411,18 +1109,27 @@ public final class MachineInfo {
                             "OFFICE_PUNE_LNG",
                             73.925595));
 
-            log.info("Private subnet matched Pune: {}", privateIp);
+            log.info(
+                    "Private subnet matched Pune: {}",
+                    privateIp);
+
             return true;
         }
 
         // NASHIK
+
         String nashikSubnets =
                 EnvConfig.get(
                                 "OFFICE_NASHIK_SUBNETS",
-                                "192.168.210.0/24,192.168.137.0/24,192.168.8.0/24,192.168.9.0/24")
+                                "192.168.210.0/24,"
+                                        + "192.168.137.0/24,"
+                                        + "192.168.8.0/24,"
+                                        + "192.168.9.0/24")
                         .trim();
 
-        if (matchesAnySubnet(privateIp, nashikSubnets)) {
+        if (matchesAnySubnet(
+                privateIp,
+                nashikSubnets)) {
 
             putOfficeLocation(
                     result,
@@ -436,38 +1143,50 @@ public final class MachineInfo {
                             "OFFICE_NASHIK_LNG",
                             73.7265));
 
-            log.info("Private subnet matched Nashik: {}", privateIp);
+            log.info(
+                    "Private subnet matched Nashik: {}",
+                    privateIp);
+
             return true;
         }
 
         // EXTRA OFFICE NETWORKS
+
         String extraSubnets =
                 EnvConfig.get(
                                 "OFFICE_EXTRA_SUBNETS",
-                                "192.168.70.0/24,192.168.60.0/24")
+                                "192.168.70.0/24,"
+                                        + "192.168.60.0/24")
                         .trim();
 
-        if (matchesAnySubnet(privateIp, extraSubnets)) {
+        if (matchesAnySubnet(
+                privateIp,
+                extraSubnets)) {
 
-            String city = EnvConfig.get(
-                    "OFFICE_EXTRA_CITY",
-                    "Pune").trim();
+            String city =
+                    EnvConfig.get(
+                            "OFFICE_EXTRA_CITY",
+                            "Pune").trim();
 
-            String region = EnvConfig.get(
-                    "OFFICE_EXTRA_REGION",
-                    "Maharashtra").trim();
+            String region =
+                    EnvConfig.get(
+                            "OFFICE_EXTRA_REGION",
+                            "Maharashtra").trim();
 
-            String country = EnvConfig.get(
-                    "OFFICE_EXTRA_COUNTRY",
-                    "India").trim();
+            String country =
+                    EnvConfig.get(
+                            "OFFICE_EXTRA_COUNTRY",
+                            "India").trim();
 
-            double lat = EnvConfig.getDouble(
-                    "OFFICE_EXTRA_LAT",
-                    18.511033);
+            double lat =
+                    EnvConfig.getDouble(
+                            "OFFICE_EXTRA_LAT",
+                            18.511033);
 
-            double lng = EnvConfig.getDouble(
-                    "OFFICE_EXTRA_LNG",
-                    73.925595);
+            double lng =
+                    EnvConfig.getDouble(
+                            "OFFICE_EXTRA_LNG",
+                            73.925595);
 
             putOfficeLocation(
                     result,
@@ -499,47 +1218,62 @@ public final class MachineInfo {
         result.put("city", city);
         result.put("region", region);
         result.put("country", country);
+
         result.put(
                 "address",
-                buildAddress(city, region, country));
+                buildAddress(
+                        city,
+                        region,
+                        country));
 
-        result.put("latitude", latitude);
-        result.put("longitude", longitude);
+        result.put(
+                "latitude",
+                latitude);
+
+        result.put(
+                "longitude",
+                longitude);
+
+        result.put(
+                "accuracy",
+                null);
+
         result.put("zip", null);
     }
 
-    /**
-     * Supports real CIDR:
-     *   192.168.30.0/24
-     *
-     * Also supports:
-     *   192.168.30
-     *   192.168.30.15
-     *
-     * Malformed entries are ignored.
-     */
+    // -----------------------------------------------------------------
+    // SUBNET
+    // -----------------------------------------------------------------
+
     private static boolean matchesAnySubnet(
             String ip,
             String subnetsCsv) {
 
-        if (ip == null ||
-                ip.isBlank() ||
-                subnetsCsv == null ||
-                subnetsCsv.isBlank()) {
+        if (ip == null
+                || ip.isBlank()
+                || subnetsCsv == null
+                || subnetsCsv.isBlank()) {
+
             return false;
         }
 
         long ipLong;
 
         try {
-            ipLong = ipToLong(ip);
+
+            ipLong =
+                    ipToLong(ip);
+
         } catch (Exception e) {
+
             return false;
         }
 
-        return Stream.of(subnetsCsv.split(","))
+        return Stream.of(
+                        subnetsCsv.split(","))
                 .map(String::trim)
-                .filter(value -> !value.isBlank())
+                .filter(value ->
+                        !value.isBlank())
                 .anyMatch(entry ->
                         matchesSubnetEntry(
                                 ip,
@@ -556,16 +1290,20 @@ public final class MachineInfo {
 
             if (entry.contains("/")) {
 
-                String[] parts = entry.split("/");
+                String[] parts =
+                        entry.split("/");
 
                 if (parts.length != 2) {
                     return false;
                 }
 
                 int bits =
-                        Integer.parseInt(parts[1].trim());
+                        Integer.parseInt(
+                                parts[1].trim());
 
-                if (bits < 0 || bits > 32) {
+                if (bits < 0
+                        || bits > 32) {
+
                     return false;
                 }
 
@@ -577,7 +1315,8 @@ public final class MachineInfo {
                 long mask =
                         bits == 0
                                 ? 0L
-                                : (0xFFFFFFFFL << (32 - bits))
+                                : (0xFFFFFFFFL
+                                << (32 - bits))
                                 & 0xFFFFFFFFL;
 
                 return (ipLong & mask)
@@ -588,7 +1327,9 @@ public final class MachineInfo {
                     entry.split("\\.").length;
 
             if (octetCount == 4) {
-                return ipToLong(entry) == ipLong;
+
+                return ipToLong(entry)
+                        == ipLong;
             }
 
             String prefix =
@@ -608,12 +1349,14 @@ public final class MachineInfo {
         }
     }
 
-    private static long ipToLong(String ip) {
+    private static long ipToLong(
+            String ip) {
 
         String[] octets =
                 ip.trim().split("\\.");
 
         if (octets.length != 4) {
+
             throw new IllegalArgumentException(
                     "Not IPv4: " + ip);
         }
@@ -623,15 +1366,19 @@ public final class MachineInfo {
         for (String octet : octets) {
 
             int part =
-                    Integer.parseInt(octet.trim());
+                    Integer.parseInt(
+                            octet.trim());
 
-            if (part < 0 || part > 255) {
+            if (part < 0
+                    || part > 255) {
+
                 throw new IllegalArgumentException(
                         "Invalid IPv4: " + ip);
             }
 
             value =
-                    (value << 8) | part;
+                    (value << 8)
+                            | part;
         }
 
         return value & 0xFFFFFFFFL;
@@ -641,7 +1388,8 @@ public final class MachineInfo {
             String maybePartial) {
 
         String[] octets =
-                maybePartial.trim().split("\\.");
+                maybePartial.trim()
+                        .split("\\.");
 
         StringBuilder result =
                 new StringBuilder();
@@ -653,8 +1401,8 @@ public final class MachineInfo {
             }
 
             result.append(
-                    i < octets.length &&
-                            !octets[i].isBlank()
+                    i < octets.length
+                            && !octets[i].isBlank()
                             ? octets[i].trim()
                             : "0");
         }
@@ -663,36 +1411,43 @@ public final class MachineInfo {
     }
 
     // -----------------------------------------------------------------
-    // PRIVATE IP DISCOVERY
+    // PRIVATE IP
     // -----------------------------------------------------------------
 
     public static String getPrivateIp() {
 
         try {
 
-            Enumeration<NetworkInterface> interfaces =
-                    NetworkInterface.getNetworkInterfaces();
+            Enumeration<NetworkInterface>
+                    interfaces =
+                    NetworkInterface
+                            .getNetworkInterfaces();
 
             if (interfaces != null) {
 
-                for (NetworkInterface networkInterface :
-                        Collections.list(interfaces)) {
+                for (NetworkInterface
+                        networkInterface :
+                        Collections.list(
+                                interfaces)) {
 
                     if (!networkInterface.isUp()
                             || networkInterface.isLoopback()
                             || networkInterface.isVirtual()) {
+
                         continue;
                     }
 
                     for (InetAddress address :
                             Collections.list(
-                                    networkInterface.getInetAddresses())) {
+                                    networkInterface
+                                            .getInetAddresses())) {
 
                         String hostAddress =
                                 address.getHostAddress();
 
                         if (address.isSiteLocalAddress()
-                                && !address.isLoopbackAddress()
+                                && !address
+                                .isLoopbackAddress()
                                 && hostAddress.indexOf(':') < 0) {
 
                             return hostAddress;
@@ -702,7 +1457,9 @@ public final class MachineInfo {
             }
 
             String localHost =
-                    InetAddress.getLocalHost().getHostAddress();
+                    InetAddress
+                            .getLocalHost()
+                            .getHostAddress();
 
             return isValidIpv4(localHost)
                     ? localHost
@@ -722,59 +1479,80 @@ public final class MachineInfo {
     // VALIDATION
     // -----------------------------------------------------------------
 
-    private static boolean isValidIpv4(String ip) {
+    private static boolean isValidIpv4(
+            String ip) {
 
         try {
+
             ipToLong(ip);
+
             return true;
+
         } catch (Exception e) {
+
             return false;
         }
     }
 
     // -----------------------------------------------------------------
-    // HTTP
+    // HTTP GET
     // -----------------------------------------------------------------
 
     private static String httpGet(
             String urlString,
             String userAgent) {
 
-        HttpURLConnection connection = null;
+        HttpURLConnection connection =
+                null;
 
         try {
 
             URL url =
-                    URI.create(urlString).toURL();
+                    URI.create(
+                                    urlString)
+                            .toURL();
 
             connection =
                     (HttpURLConnection)
                             url.openConnection();
 
-            connection.setRequestMethod("GET");
+            connection.setRequestMethod(
+                    "GET");
+
             connection.setConnectTimeout(
                     HTTP_TIMEOUT_MS);
+
             connection.setReadTimeout(
                     HTTP_TIMEOUT_MS);
 
             if (userAgent != null) {
+
                 connection.setRequestProperty(
                         "User-Agent",
                         userAgent);
             }
 
-            if (connection.getResponseCode() != 200) {
+            if (connection.getResponseCode()
+                    != 200) {
+
+                log.debug(
+                        "HTTP GET returned status {} for {}",
+                        connection.getResponseCode(),
+                        urlString);
+
                 return null;
             }
 
             try (BufferedReader reader =
                          new BufferedReader(
                                  new InputStreamReader(
-                                         connection.getInputStream(),
+                                         connection
+                                                 .getInputStream(),
                                          StandardCharsets.UTF_8))) {
 
                 return reader.lines()
-                        .collect(Collectors.joining());
+                        .collect(
+                                Collectors.joining());
             }
 
         } catch (Exception e) {
@@ -789,27 +1567,882 @@ public final class MachineInfo {
         } finally {
 
             if (connection != null) {
+
                 connection.disconnect();
             }
         }
     }
 
     // -----------------------------------------------------------------
-    // ADDRESS
+    // HELPERS
     // -----------------------------------------------------------------
+
+    private static Double toDouble(
+            Object value) {
+
+        if (value == null) {
+            return null;
+        }
+
+        try {
+
+            return Double.parseDouble(
+                    String.valueOf(value));
+
+        } catch (Exception e) {
+
+            return null;
+        }
+    }
+
+    private static String emptyToNull(
+            String value) {
+
+        return value == null
+                || value.isBlank()
+                ? null
+                : value;
+    }
+
+    private static boolean isWindows() {
+
+        return System.getProperty(
+                        "os.name",
+                        "")
+                .toLowerCase()
+                .contains("win");
+    }
 
     private static String buildAddress(
             String city,
             String region,
             String country) {
 
-        return Stream.of(city, region, country)
+        return Stream.of(
+                        city,
+                        region,
+                        country)
                 .filter(value ->
-                        value != null &&
-                                !value.isBlank())
-                .collect(Collectors.joining(", "));
+                        value != null
+                                && !value.isBlank())
+                .collect(
+                        Collectors.joining(
+                                ", "));
     }
 }
+//package com.activepulse.agent.util;
+
+//
+//import org.slf4j.Logger;
+//import org.slf4j.LoggerFactory;
+//
+//import java.io.BufferedReader;
+//import java.io.InputStreamReader;
+//import java.net.HttpURLConnection;
+//import java.net.InetAddress;
+//import java.net.NetworkInterface;
+//import java.net.URI;
+//import java.net.URL;
+//import java.nio.charset.StandardCharsets;
+//import java.time.Duration;
+//import java.time.Instant;
+//import java.util.Collections;
+//import java.util.Enumeration;
+//import java.util.LinkedHashMap;
+//import java.util.Map;
+//import java.util.stream.Collectors;
+//import java.util.stream.Stream;
+//
+///**
+// * Builds the nested `location` block sent in each sync payload.
+// *
+// * WFH/WFO strategy:
+// *  1. Always collect private IP.
+// *  2. Always collect public IP.
+// *  3. If private IP belongs to a configured office subnet -> WFO.
+// *  4. Else if public IP matches a configured office public IP -> WFO.
+// *  5. Else -> WFH_NETWORK.
+// *
+// * Important:
+// *  - Existing location payload structure is unchanged.
+// *  - WFH does NOT use approximate GPS/IP coordinates.
+// *  - Google Geolocation, Windows Location and IP geolocation are deliberately
+// *    not used for WFH/WFO classification.
+// *  - Office coordinates are authoritative configured office coordinates,
+// *    not user/device coordinates.
+// */
+//public final class MachineInfo {
+//
+//    private static final Logger log = LoggerFactory.getLogger(MachineInfo.class);
+//
+//    private static final int HTTP_TIMEOUT_MS = 5_000;
+//    private static final Duration CACHE_TTL = Duration.ofMinutes(5);
+//
+//    private static volatile Map<String, Object> cachedLocation;
+//    private static volatile Instant cachedAt;
+//
+//    private MachineInfo() {
+//    }
+//
+//    public static Map<String, Object> getLocationPayload() {
+//        Instant now = Instant.now();
+//
+//        if (cachedLocation != null && cachedAt != null) {
+//            Duration age = Duration.between(cachedAt, now);
+//            if (age.compareTo(CACHE_TTL) < 0) {
+//                return cachedLocation;
+//            }
+//        }
+//
+//        Map<String, Object> result = buildLocationPayload();
+//        cachedLocation = result;
+//        cachedAt = now;
+//        return result;
+//    }
+//
+//    @Deprecated
+//    public static Map<String, Object> getSyncDetails() {
+//        Map<String, Object> loc = getLocationPayload();
+//
+//        Map<String, Object> out = new LinkedHashMap<>();
+//        out.put("privateIp", loc.get("privateIp"));
+//        out.put("publicIp", loc.get("publicIp"));
+//        out.put("locationDetails",
+//                Stream.of(
+//                                loc.get("city"),
+//                                loc.get("region"),
+//                                loc.get("country"))
+//                        .filter(value -> value != null && !String.valueOf(value).isBlank())
+//                        .map(String::valueOf)
+//                        .collect(Collectors.joining(", ")));
+//        return out;
+//    }
+//
+//    /**
+//     * Creates the location payload.
+//     *
+//     * WFO:
+//     *   - private IP matches an office subnet OR
+//     *   - public IP matches an office public IP
+//     *
+//     * WFH:
+//     *   - neither office signal matches
+//     *
+//     * WFH latitude/longitude are intentionally null.
+//     */
+//    private static Map<String, Object> buildLocationPayload() {
+//
+//        Map<String, Object> result = new LinkedHashMap<>();
+//
+//        String privateIp = getPrivateIp();
+//        String publicIp = getPublicIp();
+//
+//        result.put("address", null);
+//        result.put("latitude", null);
+//        result.put("longitude", null);
+//        result.put("city", null);
+//        result.put("region", null);
+//        result.put("country", null);
+//        result.put("zip", null);
+//
+//        result.put("publicIp", publicIp);
+//        result.put("privateIp", privateIp);
+//
+//        result.put("locationSource", "UNKNOWN");
+//
+//        // -------------------------------------------------------------
+//        // 1. PRIVATE OFFICE NETWORK
+//        // -------------------------------------------------------------
+//        if (applyOfficeOverride(result)) {
+//            result.put("locationSource", "OFFICE_PRIVATE_SUBNET");
+//
+//            log.info("Office detected from private subnet. privateIp={}, publicIp={}",
+//                    privateIp, publicIp);
+//
+//            return result;
+//        }
+//
+//        // -------------------------------------------------------------
+//        // 2. PUBLIC OFFICE IP
+//        // -------------------------------------------------------------
+//        if (applyPublicIpOfficeOverride(result, publicIp)) {
+//            result.put("locationSource", "OFFICE_PUBLIC_IP");
+//
+//            log.info("Office detected from public IP. publicIp={}, privateIp={}",
+//                    publicIp, privateIp);
+//
+//            return result;
+//        }
+//
+//        // -------------------------------------------------------------
+//        // 3. OPTIONAL OFFICE SSID
+//        //
+//        // SSID is only used if explicitly configured. It is an additional
+//        // exact office signal and does not use coordinates from the device.
+//        // -------------------------------------------------------------
+//        if (matchesOfficeSsid(result)) {
+//            result.put("locationSource", "OFFICE_SSID");
+//
+//            log.info("Office detected from configured SSID. publicIp={}, privateIp={}",
+//                    publicIp, privateIp);
+//
+//            return result;
+//        }
+//
+//        // -------------------------------------------------------------
+//        // 4. NOT AN OFFICE NETWORK -> WFH
+//        //
+//        // No approximate coordinates are generated.
+//        // -------------------------------------------------------------
+//        result.put("locationSource", "WFH_NETWORK");
+//
+//        log.info("WFH detected. publicIp={}, privateIp={}", publicIp, privateIp);
+//
+//        return result;
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // PUBLIC IP
+//    // -----------------------------------------------------------------
+//
+//    /**
+//     * Gets the current public IPv4 address.
+//     *
+//     * HTTPS provider is used. If the lookup fails, the payload still goes
+//     * forward with an empty publicIp; backend can use private subnet or mark
+//     * the location as unknown according to its own policy.
+//     */
+//    public static String getPublicIp() {
+//        try {
+//            String ip = httpGet("https://api.ipify.org", "ActivePulse/1.0");
+//            if (ip != null && !ip.isBlank() && isValidIpv4(ip.trim())) {
+//                return ip.trim();
+//            }
+//        } catch (Exception e) {
+//            log.debug("getPublicIp failed: {}", e.getMessage());
+//        }
+//
+//        return "";
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // OFFICE PUBLIC IP
+//    // -----------------------------------------------------------------
+//
+//    private static boolean applyPublicIpOfficeOverride(
+//            Map<String, Object> result,
+//            String publicIp) {
+//
+//        if (publicIp == null || publicIp.isBlank()) {
+//            return false;
+//        }
+//
+//        String officePublicIps =
+//                EnvConfig.get("OFFICE_PUBLIC_IPS", "").trim();
+//
+//        if (officePublicIps.isBlank()) {
+//            return false;
+//        }
+//
+//        boolean matched = Stream.of(officePublicIps.split(","))
+//                .map(String::trim)
+//                .filter(value -> !value.isBlank())
+//                .anyMatch(publicIp::equals);
+//
+//        if (!matched) {
+//            return false;
+//        }
+//
+//        String city = EnvConfig.get(
+//                "OFFICE_PUBLIC_IP_CITY",
+//                "Pune").trim();
+//
+//        String region = EnvConfig.get(
+//                "OFFICE_PUBLIC_IP_REGION",
+//                "Maharashtra").trim();
+//
+//        String country = EnvConfig.get(
+//                "OFFICE_PUBLIC_IP_COUNTRY",
+//                "India").trim();
+//
+//        result.put("city", city);
+//        result.put("region", region);
+//        result.put("country", country);
+//        result.put("address", buildAddress(city, region, country));
+//        result.put("zip", null);
+//
+//        result.put(
+//                "latitude",
+//                EnvConfig.getDouble(
+//                        "OFFICE_PUBLIC_IP_LAT",
+//                        18.511033));
+//
+//        result.put(
+//                "longitude",
+//                EnvConfig.getDouble(
+//                        "OFFICE_PUBLIC_IP_LNG",
+//                        73.925595));
+//
+//        log.info("Office public IP match: {} -> {}", publicIp, city);
+//
+//        return true;
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // OFFICE SSID
+//    // -----------------------------------------------------------------
+//
+//    private static String getCurrentSsid() {
+//
+//        if (!System.getProperty("os.name", "")
+//                .toLowerCase()
+//                .contains("win")) {
+//            return "";
+//        }
+//
+//        Process process = null;
+//
+//        try {
+//            process = new ProcessBuilder(
+//                    "netsh",
+//                    "wlan",
+//                    "show",
+//                    "interfaces")
+//                    .redirectErrorStream(true)
+//                    .start();
+//
+//            try (BufferedReader reader =
+//                         new BufferedReader(
+//                                 new InputStreamReader(
+//                                         process.getInputStream(),
+//                                         StandardCharsets.UTF_8))) {
+//
+//                String line;
+//
+//                while ((line = reader.readLine()) != null) {
+//
+//                    String trimmed = line.trim();
+//                    int index = trimmed.indexOf(':');
+//
+//                    if (index <= 0) {
+//                        continue;
+//                    }
+//
+//                    String key = trimmed.substring(0, index).trim();
+//
+//                    if ("SSID".equalsIgnoreCase(key)) {
+//                        return trimmed.substring(index + 1).trim();
+//                    }
+//                }
+//            }
+//
+//            process.waitFor(
+//                    4,
+//                    java.util.concurrent.TimeUnit.SECONDS);
+//
+//        } catch (Exception e) {
+//            log.debug("getCurrentSsid failed: {}", e.getMessage());
+//
+//        } finally {
+//            if (process != null && process.isAlive()) {
+//                process.destroyForcibly();
+//            }
+//        }
+//
+//        return "";
+//    }
+//
+//    private static boolean matchesOfficeSsid(
+//            Map<String, Object> result) {
+//
+//        String configuredSsids =
+//                EnvConfig.get("OFFICE_SSIDS", "").trim();
+//
+//        if (configuredSsids.isBlank()) {
+//            return false;
+//        }
+//
+//        String currentSsid = getCurrentSsid();
+//
+//        if (currentSsid.isBlank()) {
+//            return false;
+//        }
+//
+//        boolean matched = Stream.of(configuredSsids.split(","))
+//                .map(String::trim)
+//                .filter(value -> !value.isBlank())
+//                .anyMatch(currentSsid::equalsIgnoreCase);
+//
+//        if (!matched) {
+//            return false;
+//        }
+//
+//        String city = EnvConfig.get(
+//                "OFFICE_SSID_CITY",
+//                "Pune").trim();
+//
+//        String region = EnvConfig.get(
+//                "OFFICE_SSID_REGION",
+//                "Maharashtra").trim();
+//
+//        String country = EnvConfig.get(
+//                "OFFICE_SSID_COUNTRY",
+//                "India").trim();
+//
+//        result.put("city", city);
+//        result.put("region", region);
+//        result.put("country", country);
+//        result.put("address", buildAddress(city, region, country));
+//
+//        result.put(
+//                "latitude",
+//                EnvConfig.getDouble(
+//                        "OFFICE_SSID_LAT",
+//                        18.511033));
+//
+//        result.put(
+//                "longitude",
+//                EnvConfig.getDouble(
+//                        "OFFICE_SSID_LNG",
+//                        73.925595));
+//
+//        return true;
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // OFFICE PRIVATE SUBNET
+//    // -----------------------------------------------------------------
+//
+//    private static boolean applyOfficeOverride(
+//            Map<String, Object> result) {
+//
+//        String privateIp =
+//                String.valueOf(
+//                        result.getOrDefault("privateIp", ""));
+//
+//        if (privateIp.isBlank()) {
+//            return false;
+//        }
+//
+//        // PUNE
+//        String puneSubnets =
+//                EnvConfig.get(
+//                        "OFFICE_PUNE_SUBNETS",
+//                        "192.168.30.0/24").trim();
+//
+//        if (matchesAnySubnet(privateIp, puneSubnets)) {
+//
+//            putOfficeLocation(
+//                    result,
+//                    "Pune",
+//                    "Maharashtra",
+//                    "India",
+//                    EnvConfig.getDouble(
+//                            "OFFICE_PUNE_LAT",
+//                            18.511033),
+//                    EnvConfig.getDouble(
+//                            "OFFICE_PUNE_LNG",
+//                            73.925595));
+//
+//            log.info("Private subnet matched Pune: {}", privateIp);
+//            return true;
+//        }
+//
+//        // NASHIK
+//        String nashikSubnets =
+//                EnvConfig.get(
+//                                "OFFICE_NASHIK_SUBNETS",
+//                                "192.168.210.0/24,192.168.137.0/24,192.168.8.0/24,192.168.9.0/24")
+//                        .trim();
+//
+//        if (matchesAnySubnet(privateIp, nashikSubnets)) {
+//
+//            putOfficeLocation(
+//                    result,
+//                    "Nashik",
+//                    "Maharashtra",
+//                    "India",
+//                    EnvConfig.getDouble(
+//                            "OFFICE_NASHIK_LAT",
+//                            19.9433),
+//                    EnvConfig.getDouble(
+//                            "OFFICE_NASHIK_LNG",
+//                            73.7265));
+//
+//            log.info("Private subnet matched Nashik: {}", privateIp);
+//            return true;
+//        }
+//
+//        // EXTRA OFFICE NETWORKS
+//        String extraSubnets =
+//                EnvConfig.get(
+//                                "OFFICE_EXTRA_SUBNETS",
+//                                "192.168.70.0/24,192.168.60.0/24")
+//                        .trim();
+//
+//        if (matchesAnySubnet(privateIp, extraSubnets)) {
+//
+//            String city = EnvConfig.get(
+//                    "OFFICE_EXTRA_CITY",
+//                    "Pune").trim();
+//
+//            String region = EnvConfig.get(
+//                    "OFFICE_EXTRA_REGION",
+//                    "Maharashtra").trim();
+//
+//            String country = EnvConfig.get(
+//                    "OFFICE_EXTRA_COUNTRY",
+//                    "India").trim();
+//
+//            double lat = EnvConfig.getDouble(
+//                    "OFFICE_EXTRA_LAT",
+//                    18.511033);
+//
+//            double lng = EnvConfig.getDouble(
+//                    "OFFICE_EXTRA_LNG",
+//                    73.925595);
+//
+//            putOfficeLocation(
+//                    result,
+//                    city,
+//                    region,
+//                    country,
+//                    lat,
+//                    lng);
+//
+//            log.info(
+//                    "Private subnet matched extra office: {} -> {}",
+//                    privateIp,
+//                    city);
+//
+//            return true;
+//        }
+//
+//        return false;
+//    }
+//
+//    private static void putOfficeLocation(
+//            Map<String, Object> result,
+//            String city,
+//            String region,
+//            String country,
+//            double latitude,
+//            double longitude) {
+//
+//        result.put("city", city);
+//        result.put("region", region);
+//        result.put("country", country);
+//        result.put(
+//                "address",
+//                buildAddress(city, region, country));
+//
+//        result.put("latitude", latitude);
+//        result.put("longitude", longitude);
+//        result.put("zip", null);
+//    }
+//
+//    /**
+//     * Supports real CIDR:
+//     *   192.168.30.0/24
+//     *
+//     * Also supports:
+//     *   192.168.30
+//     *   192.168.30.15
+//     *
+//     * Malformed entries are ignored.
+//     */
+//    private static boolean matchesAnySubnet(
+//            String ip,
+//            String subnetsCsv) {
+//
+//        if (ip == null ||
+//                ip.isBlank() ||
+//                subnetsCsv == null ||
+//                subnetsCsv.isBlank()) {
+//            return false;
+//        }
+//
+//        long ipLong;
+//
+//        try {
+//            ipLong = ipToLong(ip);
+//        } catch (Exception e) {
+//            return false;
+//        }
+//
+//        return Stream.of(subnetsCsv.split(","))
+//                .map(String::trim)
+//                .filter(value -> !value.isBlank())
+//                .anyMatch(entry ->
+//                        matchesSubnetEntry(
+//                                ip,
+//                                ipLong,
+//                                entry));
+//    }
+//
+//    private static boolean matchesSubnetEntry(
+//            String ip,
+//            long ipLong,
+//            String entry) {
+//
+//        try {
+//
+//            if (entry.contains("/")) {
+//
+//                String[] parts = entry.split("/");
+//
+//                if (parts.length != 2) {
+//                    return false;
+//                }
+//
+//                int bits =
+//                        Integer.parseInt(parts[1].trim());
+//
+//                if (bits < 0 || bits > 32) {
+//                    return false;
+//                }
+//
+//                long network =
+//                        ipToLong(
+//                                padToFullIp(
+//                                        parts[0].trim()));
+//
+//                long mask =
+//                        bits == 0
+//                                ? 0L
+//                                : (0xFFFFFFFFL << (32 - bits))
+//                                & 0xFFFFFFFFL;
+//
+//                return (ipLong & mask)
+//                        == (network & mask);
+//            }
+//
+//            int octetCount =
+//                    entry.split("\\.").length;
+//
+//            if (octetCount == 4) {
+//                return ipToLong(entry) == ipLong;
+//            }
+//
+//            String prefix =
+//                    entry.endsWith(".")
+//                            ? entry
+//                            : entry + ".";
+//
+//            return ip.startsWith(prefix);
+//
+//        } catch (Exception e) {
+//
+//            log.debug(
+//                    "Skipping malformed subnet entry '{}'",
+//                    entry);
+//
+//            return false;
+//        }
+//    }
+//
+//    private static long ipToLong(String ip) {
+//
+//        String[] octets =
+//                ip.trim().split("\\.");
+//
+//        if (octets.length != 4) {
+//            throw new IllegalArgumentException(
+//                    "Not IPv4: " + ip);
+//        }
+//
+//        long value = 0;
+//
+//        for (String octet : octets) {
+//
+//            int part =
+//                    Integer.parseInt(octet.trim());
+//
+//            if (part < 0 || part > 255) {
+//                throw new IllegalArgumentException(
+//                        "Invalid IPv4: " + ip);
+//            }
+//
+//            value =
+//                    (value << 8) | part;
+//        }
+//
+//        return value & 0xFFFFFFFFL;
+//    }
+//
+//    private static String padToFullIp(
+//            String maybePartial) {
+//
+//        String[] octets =
+//                maybePartial.trim().split("\\.");
+//
+//        StringBuilder result =
+//                new StringBuilder();
+//
+//        for (int i = 0; i < 4; i++) {
+//
+//            if (i > 0) {
+//                result.append('.');
+//            }
+//
+//            result.append(
+//                    i < octets.length &&
+//                            !octets[i].isBlank()
+//                            ? octets[i].trim()
+//                            : "0");
+//        }
+//
+//        return result.toString();
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // PRIVATE IP DISCOVERY
+//    // -----------------------------------------------------------------
+//
+//    public static String getPrivateIp() {
+//
+//        try {
+//
+//            Enumeration<NetworkInterface> interfaces =
+//                    NetworkInterface.getNetworkInterfaces();
+//
+//            if (interfaces != null) {
+//
+//                for (NetworkInterface networkInterface :
+//                        Collections.list(interfaces)) {
+//
+//                    if (!networkInterface.isUp()
+//                            || networkInterface.isLoopback()
+//                            || networkInterface.isVirtual()) {
+//                        continue;
+//                    }
+//
+//                    for (InetAddress address :
+//                            Collections.list(
+//                                    networkInterface.getInetAddresses())) {
+//
+//                        String hostAddress =
+//                                address.getHostAddress();
+//
+//                        if (address.isSiteLocalAddress()
+//                                && !address.isLoopbackAddress()
+//                                && hostAddress.indexOf(':') < 0) {
+//
+//                            return hostAddress;
+//                        }
+//                    }
+//                }
+//            }
+//
+//            String localHost =
+//                    InetAddress.getLocalHost().getHostAddress();
+//
+//            return isValidIpv4(localHost)
+//                    ? localHost
+//                    : "";
+//
+//        } catch (Exception e) {
+//
+//            log.debug(
+//                    "getPrivateIp failed: {}",
+//                    e.getMessage());
+//
+//            return "";
+//        }
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // VALIDATION
+//    // -----------------------------------------------------------------
+//
+//    private static boolean isValidIpv4(String ip) {
+//
+//        try {
+//            ipToLong(ip);
+//            return true;
+//        } catch (Exception e) {
+//            return false;
+//        }
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // HTTP
+//    // -----------------------------------------------------------------
+//
+//    private static String httpGet(
+//            String urlString,
+//            String userAgent) {
+//
+//        HttpURLConnection connection = null;
+//
+//        try {
+//
+//            URL url =
+//                    URI.create(urlString).toURL();
+//
+//            connection =
+//                    (HttpURLConnection)
+//                            url.openConnection();
+//
+//            connection.setRequestMethod("GET");
+//            connection.setConnectTimeout(
+//                    HTTP_TIMEOUT_MS);
+//            connection.setReadTimeout(
+//                    HTTP_TIMEOUT_MS);
+//
+//            if (userAgent != null) {
+//                connection.setRequestProperty(
+//                        "User-Agent",
+//                        userAgent);
+//            }
+//
+//            if (connection.getResponseCode() != 200) {
+//                return null;
+//            }
+//
+//            try (BufferedReader reader =
+//                         new BufferedReader(
+//                                 new InputStreamReader(
+//                                         connection.getInputStream(),
+//                                         StandardCharsets.UTF_8))) {
+//
+//                return reader.lines()
+//                        .collect(Collectors.joining());
+//            }
+//
+//        } catch (Exception e) {
+//
+//            log.debug(
+//                    "HTTP GET {} failed: {}",
+//                    urlString,
+//                    e.getMessage());
+//
+//            return null;
+//
+//        } finally {
+//
+//            if (connection != null) {
+//                connection.disconnect();
+//            }
+//        }
+//    }
+//
+//    // -----------------------------------------------------------------
+//    // ADDRESS
+//    // -----------------------------------------------------------------
+//
+//    private static String buildAddress(
+//            String city,
+//            String region,
+//            String country) {
+//
+//        return Stream.of(city, region, country)
+//                .filter(value ->
+//                        value != null &&
+//                                !value.isBlank())
+//                .collect(Collectors.joining(", "));
+//    }
+//}
 
 //package com.activepulse.agent.util;
 //
